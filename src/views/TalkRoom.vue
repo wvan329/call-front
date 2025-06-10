@@ -18,7 +18,7 @@ export default {
 
     // 初始化WebSocket连接
     const initSocket = () => {
-      socket.value = new WebSocket('wss://59.110.35.198/wgk/ws');
+      socket.value = new WebSocket('wss://test.wgk-fun.top/wgk/ws');
       
       socket.value.onmessage = async (event) => {
         const data = JSON.parse(event.data);
