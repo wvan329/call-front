@@ -1,135 +1,166 @@
 <template>
   <div>
-    <button @mousedown="startCall" @mouseup="endCall">按住说话</button>
-    <audio ref="remoteAudio" autoplay></audio>
+    <button @mousedown="startSpeaking" @mouseup="stopSpeaking">按住说话</button>
+    <audio v-for="(stream, id) in remoteStreams" :key="id" :ref="setAudioRef(id)" autoplay></audio>
   </div>
 </template>
 
 <script>
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, onUnmounted } from 'vue';
 
 export default {
   setup() {
-    const remoteAudio = ref(null);
+    const remoteStreams = ref({});
+    const audioElements = ref({});
     const localStream = ref(null);
-    const peerConnection = ref(null);
+    const peers = ref({});
     const socket = ref(null);
-    const isCalling = ref(false);
+    const host = window.location.host;
+    const myId = ref(null);
+    const room = 'default-room'; // 可扩展支持多个房间
 
-    // 初始化WebSocket连接
+    const setAudioRef = (id) => (el) => {
+      if (el) audioElements.value[id] = el;
+    };
+
+    const cleanup = () => {
+      Object.values(peers.value).forEach(pc => pc.close());
+      peers.value = {};
+      Object.values(remoteStreams.value).forEach(stream => {
+        stream.getTracks().forEach(track => track.stop());
+      });
+      remoteStreams.value = {};
+      if (localStream.value) {
+        localStream.value.getTracks().forEach(track => track.stop());
+        localStream.value = null;
+      }
+      if (socket.value) {
+        socket.value.close();
+        socket.value = null;
+      }
+    };
+
+    const startSpeaking = async () => {
+      if (!localStream.value) {
+        localStream.value = await navigator.mediaDevices.getUserMedia({ audio: true });
+        Object.values(peers.value).forEach(pc => {
+          localStream.value.getTracks().forEach(track => {
+            pc.addTrack(track, localStream.value);
+          });
+        });
+      }
+    };
+
+    const stopSpeaking = () => {
+      if (localStream.value) {
+        localStream.value.getTracks().forEach(track => track.stop());
+        localStream.value = null;
+      }
+    };
+
     const initSocket = () => {
-      socket.value = new WebSocket('wss://59.110.35.198/wgk/ws');
-      
+      socket.value = new WebSocket(`wss://${host}/wgk/ws`);
       socket.value.onmessage = async (event) => {
         const data = JSON.parse(event.data);
-        
-        if (data.type === 'offer') {
-          await handleOffer(data);
-        } else if (data.type === 'answer') {
-          await handleAnswer(data);
-        } else if (data.type === 'ice-candidate') {
-          await handleIceCandidate(data);
+
+        if (data.type === 'id') {
+          myId.value = data.id;
+        }
+
+        if (data.type === 'user-list') {
+          data.users.forEach(peerId => {
+            if (peerId !== myId.value && !peers.value[peerId]) {
+              createPeer(peerId, true);
+            }
+          });
+        }
+
+        if (data.type === 'offer' && data.to === myId.value) {
+          await createPeer(data.from, false, data.offer);
+        }
+
+        if (data.type === 'answer' && data.to === myId.value) {
+          await peers.value[data.from].setRemoteDescription(new RTCSessionDescription(data.answer));
+        }
+
+        if (data.type === 'ice-candidate' && data.to === myId.value) {
+          try {
+            await peers.value[data.from].addIceCandidate(new RTCIceCandidate(data.candidate));
+          } catch (e) {
+            console.error('添加 ICE 失败', e);
+          }
         }
       };
     };
 
-    // 初始化PeerConnection
-    const initPeerConnection = () => {
-      peerConnection.value = new RTCPeerConnection({
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' }
-        ]
-      });
+    const createPeer = async (peerId, isInitiator, remoteOffer = null) => {
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
 
-      // 处理ICE候选
-      peerConnection.value.onicecandidate = (event) => {
-        if (event.candidate) {
+      pc.onicecandidate = (e) => {
+        if (e.candidate) {
           socket.value.send(JSON.stringify({
             type: 'ice-candidate',
-            candidate: event.candidate
+            to: peerId,
+            from: myId.value,
+            candidate: e.candidate
           }));
         }
       };
 
-      // 处理远程流
-      peerConnection.value.ontrack = (event) => {
-        remoteAudio.value.srcObject = event.streams[0];
+      pc.ontrack = (e) => {
+        if (!remoteStreams.value[peerId]) {
+          remoteStreams.value[peerId] = e.streams[0];
+        }
+        if (audioElements.value[peerId]) {
+          audioElements.value[peerId].srcObject = e.streams[0];
+        }
       };
-    };
 
-    // 获取麦克风权限
-    const getLocalStream = async () => {
-      localStream.value = await navigator.mediaDevices.getUserMedia({ audio: true });
-      localStream.value.getTracks().forEach(track => {
-        peerConnection.value.addTrack(track, localStream.value);
-      });
-    };
+      // 添加本地轨道（如果已获取）
+      if (localStream.value) {
+        localStream.value.getTracks().forEach(track => {
+          pc.addTrack(track, localStream.value);
+        });
+      }
 
-    // 开始通话
-    const startCall = async () => {
-      if (isCalling.value) return;
-      isCalling.value = true;
-      
-      await initPeerConnection();
-      await getLocalStream();
-      
-      // 创建offer
-      const offer = await peerConnection.value.createOffer();
-      await peerConnection.value.setLocalDescription(offer);
-      
-      socket.value.send(JSON.stringify({
-        type: 'offer',
-        offer: offer
-      }));
-    };
+      peers.value[peerId] = pc;
 
-    // 结束通话
-    const endCall = () => {
-      if (!isCalling.value) return;
-      isCalling.value = false;
-      
-      localStream.value.getTracks().forEach(track => track.stop());
-      peerConnection.value.close();
-    };
-
-    // 处理收到的offer
-    const handleOffer = async (data) => {
-      await initPeerConnection();
-      await getLocalStream();
-      
-      await peerConnection.value.setRemoteDescription(new RTCSessionDescription(data.offer));
-      
-      const answer = await peerConnection.value.createAnswer();
-      await peerConnection.value.setLocalDescription(answer);
-      
-      socket.value.send(JSON.stringify({
-        type: 'answer',
-        answer: answer
-      }));
-    };
-
-    // 处理收到的answer
-    const handleAnswer = async (data) => {
-      await peerConnection.value.setRemoteDescription(new RTCSessionDescription(data.answer));
-    };
-
-    // 处理ICE候选
-    const handleIceCandidate = async (data) => {
-      try {
-        await peerConnection.value.addIceCandidate(new RTCIceCandidate(data.candidate));
-      } catch (e) {
-        console.error('添加ICE候选失败:', e);
+      if (isInitiator) {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.value.send(JSON.stringify({
+          type: 'offer',
+          to: peerId,
+          from: myId.value,
+          offer
+        }));
+      } else if (remoteOffer) {
+        await pc.setRemoteDescription(new RTCSessionDescription(remoteOffer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.value.send(JSON.stringify({
+          type: 'answer',
+          to: peerId,
+          from: myId.value,
+          answer
+        }));
       }
     };
 
     onMounted(() => {
+      cleanup();
       initSocket();
     });
 
+    onUnmounted(() => {
+      cleanup();
+    });
+
     return {
-      startCall,
-      endCall,
-      remoteAudio
+      startSpeaking,
+      stopSpeaking,
+      remoteStreams,
+      setAudioRef
     };
   }
 };
