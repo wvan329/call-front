@@ -1,466 +1,367 @@
 <template>
-  <div class="voice-container">
-    <div class="status-indicator" :class="{ active: isConnected }">
-      {{ statusText }}
+  <div class="chat-container">
+    <div class="header">
+      <h1>语音聊天室</h1>
+      <p>已连接: {{ Object.keys(peers).length + 1 }} 人</p>
     </div>
-    
-    <div class="controls">
-      <button class="control-button" @click="toggleMute" :disabled="!isConnected">
-        <i class="fa" :class="isMuted ? 'fa-microphone-slash' : 'fa-microphone'"></i>
-        {{ isMuted ? '取消静音' : '静音' }}
-      </button>
-      <button class="control-button" @click="toggleCall">
-        <i class="fa" :class="isConnected ? 'fa-phone' : 'fa-phone-square'"></i>
-        {{ isConnected ? '结束通话' : '开始通话' }}
-      </button>
-    </div>
-
-    <!-- 播放多个远端音频流 -->
-    <div v-for="(stream, id) in remoteStreams" :key="id" class="remote-audio-container">
-      <div class="user-info">
-        <div class="user-avatar">
-          <i class="fa fa-user"></i>
+    <div class="participants">
+      <div class="participant">
+        <div class="avatar-wrapper" :class="{ 'is-speaking': isSpeaking }">
+          <img src="https://i.pravatar.cc/150?u=local" alt="Local User" class="avatar">
         </div>
-        <div class="user-id">{{ id.substring(0, 5) }}</div>
+        <p class="name">你</p>
       </div>
-      <audio :ref="setAudioElement(id)" autoplay></audio>
+      <div v-for="(peer, peerId) in peers" :key="peerId" class="participant">
+        <div class="avatar-wrapper">
+          <img :src="`https://i.pravatar.cc/150?u=${peerId}`" alt="Remote User" class="avatar">
+        </div>
+         <p class="name">用户 {{ peerId.slice(0, 4) }}</p>
+        <audio :ref="el => { if (el) peer.audioEl = el }" autoplay></audio>
+      </div>
+    </div>
+    <div class="controls">
+      <button @click="toggleMute" class="control-btn" :class="{ 'is-muted': isMuted }">
+        <svg v-if="!isMuted" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="22"></line></svg>
+        <svg v-else xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="1" y1="1" x2="23" y2="23"></line><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"></path><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v-2a7 7 0 0 0-1.23-3.95"></path><line x1="12" y1="19" x2="12" y2="22"></line></svg>
+      </button>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onBeforeUnmount, nextTick } from 'vue';
+import { ref, onMounted, onUnmounted } from 'vue';
 
-function generateId() {
-  return Math.random().toString(36).substring(2, 10);
-}
+// --- 配置 ---
+// 确保将 'localhost:8080' 替换为你的后端 WebSocket 服务器地址和端口
+const WEBSOCKET_URL = 'ws://localhost:8080/signal'; 
 
-const host = window.location.host;
-const socket = ref(null);
+// --- 响应式状态 ---
 const localStream = ref(null);
-const userId = generateId();
-
-const peerConnections = reactive({});
-const remoteStreams = reactive({});
-
-const isConnected = ref(false);
+const peers = ref({}); // 存储所有远程连接 { peerId: { pc, audioEl } }
+const ws = ref(null);
 const isMuted = ref(false);
-const statusText = ref('正在连接...');
+const isSpeaking = ref(false);
 
-const audioRefs = reactive({});
-let reconnectTimer = null;
-const MAX_RECONNECT_ATTEMPTS = 5;
-let reconnectAttempts = 0;
+let audioContext, analyser, microphone, javascriptNode;
 
-const setAudioElement = (id) => (el) => {
-  if (el) {
-    audioRefs[id] = el;
-    if (remoteStreams[id]) {
-      el.srcObject = remoteStreams[id];
+// --- WebRTC 配置 ---
+const pc_config = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' }
+  ]
+};
+
+// --- WebSocket 处理 ---
+const connectWebSocket = () => {
+  ws.value = new WebSocket(WEBSOCKET_URL);
+
+  ws.value.onopen = () => {
+    console.log("WebSocket 连接成功!");
+    initLocalMedia(); 
+  };
+
+  ws.value.onmessage = async (event) => {
+    const message = JSON.parse(event.data);
+    const fromId = message.from;
+
+    if (message.type === 'offer') {
+      console.log(`收到来自 ${fromId} 的 offer`);
+      const peer = createPeerConnection(fromId);
+      await peer.pc.setRemoteDescription(new RTCSessionDescription(message.sdp));
+      const answer = await peer.pc.createAnswer();
+      await peer.pc.setLocalDescription(answer);
+      sendMessage({ type: 'answer', sdp: peer.pc.localDescription, to: fromId });
+    } else if (message.type === 'answer') {
+       console.log(`收到来自 ${fromId} 的 answer`);
+      if (peers.value[fromId]) {
+        await peers.value[fromId].pc.setRemoteDescription(new RTCSessionDescription(message.sdp));
+      }
+    } else if (message.type === 'candidate') {
+       console.log(`收到来自 ${fromId} 的 ICE candidate`);
+      if (peers.value[fromId]) {
+        await peers.value[fromId].pc.addIceCandidate(new RTCIceCandidate(message.candidate));
+      }
+    } else if (message.type === 'user-joined') {
+        console.log(`用户 ${fromId} 加入了房间`);
+        // 当一个新用户加入时，向他发送 offer
+        const peer = createPeerConnection(fromId);
+        const offer = await peer.pc.createOffer();
+        await peer.pc.setLocalDescription(offer);
+        sendMessage({ type: 'offer', sdp: peer.pc.localDescription, to: fromId });
+    } else if (message.type === 'user-left') {
+        console.log(`用户 ${fromId} 离开了房间`);
+        if (peers.value[fromId]) {
+            peers.value[fromId].pc.close();
+            delete peers.value[fromId];
+        }
     }
+  };
+  
+  ws.value.onclose = () => {
+    console.log("WebSocket 连接关闭");
+  };
+
+  ws.value.onerror = (error) => {
+    console.error("WebSocket 错误:", error);
+  };
+};
+
+const sendMessage = (message) => {
+    // 后端实现的是广播模式，但为了明确信令目标，我们仍可以加上 to/from
+    // 后端 handleTextMessage 稍作修改即可支持点对点信令
+    // 这里我们假设后端能处理，或者直接广播
+    ws.value.send(JSON.stringify(message));
+};
+
+
+// --- WebRTC 核心功能 ---
+const initLocalMedia = async () => {
+  try {
+    localStream.value = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    
+    // 初始化语音活动检测
+    setupSpeechDetection();
+
+    // 通知其他所有用户你的加入
+    sendMessage({ type: 'user-joined' });
+
+  } catch (error) {
+    console.error("获取麦克风权限失败:", error);
+    alert("无法获取麦克风权限，语音聊天功能无法使用。");
   }
 };
 
-function createPeerConnection(remoteId) {
-  if (peerConnections[remoteId]) return peerConnections[remoteId];
-
-  const pc = new RTCPeerConnection({
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' },
-      { urls: 'stun:stun3.l.google.com:19302' },
-      { urls: 'stun:stun.l.google.com' },
-      { urls: 'stun:stun1.l.google.com' },
-      { urls: 'stun:stun2.l.google.com' },
-    ]
-  });
+const createPeerConnection = (peerId) => {
+  const pc = new RTCPeerConnection(pc_config);
 
   pc.onicecandidate = (event) => {
-    if (event.candidate && socket.value && socket.value.readyState === WebSocket.OPEN) {
-      socket.value.send(JSON.stringify({
-        type: 'ice-candidate',
-        from: userId,
-        to: remoteId,
-        candidate: event.candidate
-      }));
+    if (event.candidate) {
+      sendMessage({ type: 'candidate', candidate: event.candidate, to: peerId });
     }
   };
 
   pc.ontrack = (event) => {
-    remoteStreams[remoteId] = event.streams[0];
-    nextTick(() => {
-      if (audioRefs[remoteId]) {
-        audioRefs[remoteId].srcObject = event.streams[0];
-      }
-    });
-    isConnected.value = true;
-    statusText.value = '通话中...';
-  };
-
-  // 监控连接状态
-  pc.onconnectionstatechange = () => {
-    console.log(`PeerConnection(${remoteId}) state:`, pc.connectionState);
-    
-    if (pc.connectionState === 'failed') {
-      statusText.value = `与 ${remoteId.substring(0, 5)} 的连接失败`;
-      setTimeout(() => {
-        if (peerConnections[remoteId]) {
-          peerConnections[remoteId].close();
-          delete peerConnections[remoteId];
-          delete remoteStreams[remoteId];
-        }
-      }, 3000);
-    } else if (pc.connectionState === 'disconnected') {
-      statusText.value = `与 ${remoteId.substring(0, 5)} 的连接断开`;
-    } else if (pc.connectionState === 'connected') {
-      statusText.value = '通话中...';
+    console.log(`收到来自 ${peerId} 的音轨`);
+    if (peers.value[peerId] && event.streams && event.streams[0]) {
+       // 等待DOM更新后，将流附加到audio元素
+       // Vue的ref机制会自动处理
+       peers.value[peerId].audioEl.srcObject = event.streams[0];
     }
   };
-
-  // 处理ICE候选者收集状态
-  pc.onicegatheringstatechange = () => {
-    console.log(`ICE gathering state for ${remoteId}:`, pc.iceGatheringState);
-  };
-
-  peerConnections[remoteId] = pc;
-
+  
+  // 将本地音频轨道添加到连接中
   if (localStream.value) {
     localStream.value.getTracks().forEach(track => {
       pc.addTrack(track, localStream.value);
     });
   }
 
-  return pc;
-}
+  peers.value[peerId] = { pc, audioEl: null };
+  return peers.value[peerId];
+};
 
-function cleanupPeerConnections() {
-  Object.values(peerConnections).forEach(pc => {
-    pc.close();
+
+// --- UI 控制 ---
+const toggleMute = () => {
+  if (!localStream.value) return;
+  localStream.value.getAudioTracks().forEach(track => {
+    track.enabled = !track.enabled;
+    isMuted.value = !track.enabled;
   });
-  
-  Object.values(remoteStreams).forEach(stream => {
-    stream.getTracks().forEach(track => track.stop());
-  });
-  
-  for (const key in peerConnections) {
-    delete peerConnections[key];
-  }
-  for (const key in remoteStreams) {
-    delete remoteStreams[key];
-  }
-  
-  isConnected.value = false;
-}
+};
 
-async function getLocalStream() {
-  try {
-    localStream.value = await navigator.mediaDevices.getUserMedia({ audio: true });
-    return true;
-  } catch (e) {
-    statusText.value = '麦克风权限拒绝';
-    console.error('获取麦克风权限失败', e);
-    return false;
-  }
-}
+// --- 语音活动检测 ---
+const setupSpeechDetection = () => {
+    if (!localStream.value || !localStream.value.getAudioTracks().length) return;
 
-async function handleMessage(data) {
-  if (data.from === userId) return;
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioContext.createAnalyser();
+    microphone = audioContext.createMediaStreamSource(localStream.value);
+    javascriptNode = audioContext.createScriptProcessor(2048, 1, 1);
 
-  switch (data.type) {
-    case 'join': {
-      const pc = createPeerConnection(data.from);
-      try {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        socket.value.send(JSON.stringify({
-          type: 'offer',
-          from: userId,
-          to: data.from,
-          offer
-        }));
-      } catch (e) {
-        console.error('创建offer失败', e);
-        statusText.value = '连接失败，请重试';
-      }
-      break;
-    }
-    case 'offer': {
-      const pc = createPeerConnection(data.from);
-      try {
-        await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket.value.send(JSON.stringify({
-          type: 'answer',
-          from: userId,
-          to: data.from,
-          answer
-        }));
-      } catch (e) {
-        console.error('处理offer失败', e);
-        statusText.value = '连接失败，请重试';
-      }
-      break;
-    }
-    case 'answer': {
-      const pc = peerConnections[data.from];
-      if (!pc) return;
-      try {
-        await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-      } catch (e) {
-        console.error('设置answer失败', e);
-        statusText.value = '连接失败，请重试';
-      }
-      break;
-    }
-    case 'ice-candidate': {
-      const pc = peerConnections[data.from];
-      if (!pc) return;
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-      } catch (e) {
-        console.error('添加ICE candidate失败', e);
-      }
-      break;
-    }
-  }
-}
+    analyser.smoothingTimeConstant = 0.8;
+    analyser.fftSize = 1024;
 
-function toggleMute() {
-  if (localStream.value) {
-    localStream.value.getAudioTracks().forEach(track => {
-      track.enabled = !track.enabled;
-    });
-    isMuted.value = !isMuted.value;
-  }
-}
+    microphone.connect(analyser);
+    analyser.connect(javascriptNode);
+    javascriptNode.connect(audioContext.destination);
 
-function connectWebSocket() {
-  socket.value = new WebSocket(`ws://${host}/wgk/ws`);
+    javascriptNode.onaudioprocess = () => {
+        const array = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(array);
+        let values = 0;
 
-  socket.value.onopen = () => {
-    statusText.value = '连接成功，加入通话...';
-    reconnectAttempts = 0;
-    clearInterval(reconnectTimer);
-    
-    // 重新加入房间
-    socket.value.send(JSON.stringify({
-      type: 'join',
-      from: userId
-    }));
-  };
+        const length = array.length;
+        for (let i = 0; i < length; i++) {
+            values += (array[i]);
+        }
 
-  socket.value.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      handleMessage(data);
-    } catch (e) {
-      console.error('解析消息失败', e);
-    }
-  };
+        const average = values / length;
+        // 设置一个阈值来判断是否在说话
+        isSpeaking.value = average > 15; 
+    };
+};
 
-  socket.value.onclose = () => {
-    statusText.value = '连接已断开，尝试重连...';
-    cleanupPeerConnections();
-    
-    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-      const delay = Math.pow(2, reconnectAttempts) * 1000;
-      reconnectAttempts++;
-      reconnectTimer = setTimeout(connectWebSocket, delay);
-    } else {
-      statusText.value = '重连失败，请刷新页面';
-    }
-  };
-  
-  socket.value.onerror = (error) => {
-    console.error('WebSocket error:', error);
-    socket.value.close();
-  };
-}
 
-async function startCall() {
-  statusText.value = '正在连接...';
-  
-  const hasMicAccess = await getLocalStream();
-  if (!hasMicAccess) {
-    return;
-  }
-  
+// --- Vue 生命周期钩子 ---
+onMounted(() => {
   connectWebSocket();
-}
-
-function endCall() {
-  if (socket.value) {
-    socket.value.close();
-    socket.value = null;
-  }
-  cleanupPeerConnections();
-  if (localStream.value) {
-    localStream.value.getTracks().forEach(t => t.stop());
-    localStream.value = null;
-  }
-  statusText.value = '点击开始通话';
-  isMuted.value = false;
-}
-
-function toggleCall() {
-  if (isConnected.value) {
-    endCall();
-  } else {
-    startCall();
-  }
-}
-
-onMounted(async () => {
-  // 页面加载后立即开始通话
-  await startCall();
 });
 
-onBeforeUnmount(() => {
-  endCall();
-  clearInterval(reconnectTimer);
+onUnmounted(() => {
+    // 清理资源
+    sendMessage({ type: 'user-left' });
+
+    if (ws.value) {
+        ws.value.close();
+    }
+    if (localStream.value) {
+        localStream.value.getTracks().forEach(track => track.stop());
+    }
+    Object.values(peers.value).forEach(peer => peer.pc.close());
+
+    if (javascriptNode) javascriptNode.onaudioprocess = null;
+    if (audioContext) audioContext.close();
 });
+
 </script>
 
 <style scoped>
-/* 保持原有样式不变 */
-.voice-container {
-  position: relative;
-  width: 100%;
-  min-height: 100vh;
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap');
+
+.chat-container {
   display: flex;
   flex-direction: column;
-  justify-content: center;
   align-items: center;
-  background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-  font-family: 'Arial', sans-serif;
-  padding: 20px;
+  justify-content: space-between;
+  height: 100vh;
+  width: 100%;
+  background-color: #121212;
+  color: #e0e0e0;
+  font-family: 'Poppins', sans-serif;
+  padding: 2rem;
   box-sizing: border-box;
 }
 
-.status-indicator {
-  padding: 15px 30px;
-  background-color: #6e8efb;
-  color: white;
-  border-radius: 50px;
-  font-size: 18px;
-  font-weight: bold;
-  margin-bottom: 30px;
-  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
-  transition: all 0.3s ease;
+.header {
   text-align: center;
+  margin-bottom: 2rem;
 }
 
-.status-indicator.active {
-  background-color: #4CAF50;
+.header h1 {
+  font-size: 2.5rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+  color: #ffffff;
 }
 
-.controls {
+.header p {
+  font-size: 1rem;
+  color: #a0a0a0;
+}
+
+.participants {
   display: flex;
-  gap: 20px;
-  margin-top: 20px;
   flex-wrap: wrap;
   justify-content: center;
-}
-
-.control-button {
-  padding: 12px 24px;
-  background: linear-gradient(145deg, #6e8efb, #a777e3);
-  border: none;
-  color: white;
-  font-size: 16px;
-  font-weight: bold;
-  border-radius: 50px;
-  cursor: pointer;
-  transition: all 0.3s ease;
-  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.control-button:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 6px 15px rgba(0, 0, 0, 0.15);
-}
-
-.control-button:active {
-  transform: translateY(0);
-}
-
-.control-button:nth-child(2) {
-  background: linear-gradient(145deg, #ff5e62, #ff9966);
-}
-
-.control-button:disabled {
-  background: #cccccc;
-  cursor: not-allowed;
-}
-
-.remote-audio-container {
-  display: flex;
-  align-items: center;
-  gap: 15px;
-  background-color: rgba(255, 255, 255, 0.8);
-  border-radius: 15px;
-  padding: 15px;
-  margin: 10px 0;
-  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.05);
+  align-items: flex-start;
+  gap: 2rem;
+  flex-grow: 1;
   width: 100%;
-  max-width: 400px;
+  max-width: 1200px;
 }
 
-.user-info {
+.participant {
   display: flex;
   flex-direction: column;
   align-items: center;
-  min-width: 60px;
 }
 
-.user-avatar {
-  width: 40px;
-  height: 40px;
-  background-color: #6e8efb;
+.avatar-wrapper {
+  position: relative;
+  width: 120px;
+  height: 120px;
   border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: white;
-  font-size: 18px;
-  margin-bottom: 5px;
+  padding: 6px;
+  background: #333;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+  transition: all 0.3s ease;
 }
 
-.user-id {
-  font-size: 12px;
-  color: #666;
-  text-align: center;
+.avatar-wrapper::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  border-radius: 50%;
+  border: 3px solid transparent;
+  transition: border-color 0.3s ease;
 }
 
-audio {
+.avatar-wrapper.is-speaking::before {
+    border-color: #4CAF50; /* 说话时显示绿色光环 */
+    animation: pulse 1.5s infinite;
+}
+
+
+.avatar {
   width: 100%;
-  max-width: 300px;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
 }
 
-@media (max-width: 768px) {
-  .status-indicator {
-    font-size: 16px;
-    padding: 12px 24px;
+.name {
+  margin-top: 1rem;
+  font-weight: 600;
+  color: #fafafa;
+}
+
+.controls {
+  padding: 1.5rem 0;
+}
+
+.control-btn {
+  background-color: #282828;
+  border: none;
+  border-radius: 50%;
+  width: 64px;
+  height: 64px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+}
+
+.control-btn:hover {
+  background-color: #383838;
+}
+
+.control-btn.is-muted {
+  background-color: #e74c3c;
+}
+
+.control-btn.is-muted:hover {
+  background-color: #c0392b;
+}
+
+.control-btn svg {
+  color: #ffffff;
+}
+
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.7);
   }
-  
-  .controls {
-    flex-direction: column;
-    gap: 15px;
+  70% {
+    box-shadow: 0 0 0 10px rgba(76, 175, 80, 0);
   }
-  
-  .control-button {
-    width: 200px;
-    justify-content: center;
-  }
-  
-  .remote-audio-container {
-    flex-direction: column;
-    text-align: center;
+  100% {
+    box-shadow: 0 0 0 0 rgba(76, 175, 80, 0);
   }
 }
-</style>    
+</style>
