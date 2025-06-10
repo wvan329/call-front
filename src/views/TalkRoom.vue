@@ -1,7 +1,7 @@
 <template>
   <div class="chat-container">
     <div class="header">
-      <h1>语音聊天室</h1>
+      <h1>神秘组织</h1>
       <p>已连接: {{ Object.keys(peers).length + 1 }} 人</p>
     </div>
     <div class="participants">
@@ -33,7 +33,7 @@ import { ref, onMounted, onUnmounted } from 'vue';
 
 // --- 配置 ---
 // 确保将 'localhost:8080' 替换为你的后端 WebSocket 服务器地址和端口
-const WEBSOCKET_URL = 'ws://localhost:8080/signal'; 
+const WEBSOCKET_URL = 'ws://59.110.35.198/wgk/ws'; 
 
 // --- 响应式状态 ---
 const localStream = ref(null);
