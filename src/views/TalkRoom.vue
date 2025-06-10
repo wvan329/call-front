@@ -1,15 +1,8 @@
 <template>
   <div class="chat-container">
-    <div v-if="isDisconnected" class="reconnect-overlay">
-      <div class="reconnect-content">
-        <div class="spinner"></div>
-        <h2>连接已中断</h2>
-        <p>正在尝试重新连接 (第 {{ reconnectAttempts }} 次)...</p>
-      </div>
-    </div>
 
     <div class="header">
-      <h1>语音聊天室</h1>
+      <h1>神秘组织</h1>
       <p>已连接: {{ Object.keys(peers).length + 1 }} 人</p>
     </div>
     <div class="participants">
