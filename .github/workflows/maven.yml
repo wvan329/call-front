@@ -1,0 +1,50 @@
+#action的名字
+name: Frontend Deploy
+#on表示event触发器，也就是在main分支推送代码/提交pr时会触发这个action
+on:
+  push:
+    branches: [ "main" ]
+
+#所有job
+jobs:
+  #只有一个job：build
+  build:
+    #action运行的虚拟环境：这个job向github申请了最新的ubuntu系统的虚拟机，用来运行job
+    runs-on: ubuntu-latest
+    #job的所有步骤
+    steps:
+      #uses使用action：checkout，这是一个最常用的别人写好的aciton。
+      #checkout：检出代码：把项目代码检出到ubuntu虚拟机里面
+      - uses: actions/checkout@v4
+
+      - name: Check commit message
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          if [[ "$COMMIT_MSG" != "yes" ]]; then
+            echo "skip=true" >> $GITHUB_ENV  # 设置环境变量 skip
+            exit 0
+          fi
+
+      - name: Set up Node.js
+        if: env.skip != 'true'  # 根据 skip 环境变量判断是否执行此步骤
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        if: env.skip != 'true'  # 根据 skip 环境变量判断是否执行此步骤
+        run: npm install
+
+      - name: Build Project
+        if: env.skip != 'true'  # 根据 skip 环境变量判断是否执行此步骤
+        run: npm run build  # 默认生成 dist 目录
+
+      - name: Deploy to Server via SSH
+        if: env.skip != 'true'  # 根据 skip 环境变量判断是否执行此步骤
+        uses: easingthemes/ssh-deploy@main
+        with:
+          SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          REMOTE_HOST: 59.110.35.198
+          REMOTE_USER: root
+          SOURCE: 'dist'  # 你要上传的本地目录
+          TARGET: /var/lib/docker/volumes/nginx-html/_data/dist  # 目标路径，视你服务器配置而定
