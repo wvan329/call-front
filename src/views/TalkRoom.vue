@@ -59,7 +59,7 @@ export default {
     };
 
     const initSocket = () => {
-      socket.value = new WebSocket(`wss://${host}/wgk/ws`);
+      socket.value = new WebSocket(`ws://${host}/api/wgk/ws`);
       socket.value.onmessage = async (event) => {
         const data = JSON.parse(event.data);
 
