@@ -47,4 +47,4 @@ jobs:
           REMOTE_HOST: 59.110.35.198
           REMOTE_USER: root
           SOURCE: 'dist'  # 你要上传的本地目录
-          TARGET: /var/lib/docker/volumes/nginx-html/_data/dist  # 目标路径，视你服务器配置而定
+          TARGET: /var/lib/docker/volumes/nginx-html/_data  # 目标路径，视你服务器配置而定
