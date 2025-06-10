@@ -60,19 +60,111 @@ const peers = ref({});
 const ws = ref(null);
 const isMuted = ref(false);
 const isSpeaking = ref(false);
+const heartbeatIntervalId = ref(null); // 用于存放我们的心跳定时器ID
 
 // --- 重连相关状态 ---
 const isDisconnected = ref(false);
 const reconnectAttempts = ref(0);
+const reconnectTimerId = ref(null);
 let isUnmounted = false; // 使用普通变量，因为它不需要是响应式的
 
 let audioContext, analyser, microphone, javascriptNode;
 
 // --- WebRTC 配置 ---
+// 修改 pc_config 以使用更好的编解码器和参数
 const pc_config = {
   iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-  // 新增配置，帮助检测连接状态
-  iceConnectionStateChange: 'failed',
+  // 新增音频配置
+  encodedInsertableStreams: true, // 启用插入式流以获得更好的控制
+  rtcpMuxPolicy: 'require', // 减少端口使用
+  bundlePolicy: 'max-bundle', // 减少端口使用
+  iceTransportPolicy: 'all', // 使用所有ICE候选
+  
+  // 音频编解码器优先级
+  sdpSemantics: 'unified-plan',
+  codecs: {
+    audio: [
+      'opus/48000/2', // 优先使用Opus编解码器
+      'PCMU/8000/1',
+      'PCMA/8000/1'
+    ]
+  }
+};
+
+// 修改 createPeerConnection 函数
+const createPeerConnection = (peerId) => {
+  const pc = new RTCPeerConnection(pc_config);
+
+  // 设置音频参数
+  const audioSenderOptions = {
+    priority: 'high',
+    degradationPreference: 'maintain-framerate',
+    codecPreferences: ['opus/48000/2']
+  };
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      sendMessage({ type: 'candidate', candidate: event.candidate, to: peerId });
+    }
+  };
+
+  pc.ontrack = (event) => {
+    if (peers.value[peerId] && event.streams && event.streams[0]) {
+      peers.value[peerId].audioEl.srcObject = event.streams[0];
+      
+      // 可以在这里添加远程音频质量监控
+      setupRemoteAudioAnalysis(event.streams[0], peerId);
+    }
+  };
+
+  if (localStream.value) {
+    localStream.value.getTracks().forEach(track => {
+      const sender = pc.addTrack(track, localStream.value);
+      
+      // 设置音频发送参数
+      if (sender.track.kind === 'audio') {
+        const params = sender.getParameters();
+        params.encodings = [{
+          active: true,
+          priority: 'high',
+          maxBitrate: 128000, // 更高的比特率
+          dtx: false // 禁用不连续传输
+        }];
+        sender.setParameters(params);
+      }
+    });
+  }
+
+  // 监控单个 peer 的连接状态和质量
+  pc.oniceconnectionstatechange = () => {
+    console.log(`Peer ${peerId} ICE connection state: ${pc.iceConnectionState}`);
+  };
+  
+  pc.onstatsended = (stats) => {
+    // 可以在这里监控网络和音频质量统计
+    console.log(`Peer ${peerId} stats:`, stats);
+  };
+
+  peers.value[peerId] = { pc, audioEl: null };
+  return peers.value[peerId];
+};
+
+// 远程音频质量分析
+const setupRemoteAudioAnalysis = (stream, peerId) => {
+  try {
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const source = audioContext.createMediaStreamSource(stream);
+    
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 2048;
+    
+    source.connect(analyser);
+    analyser.connect(audioContext.destination);
+    
+    // 可以添加定期检查远程音频质量的逻辑
+  } catch (e) {
+    console.error(`设置远程音频分析失败 (peer ${peerId}):`, e);
+  }
 };
 
 // --- WebSocket 核心功能 ---
@@ -85,10 +177,12 @@ const connectWebSocket = () => {
   ws.value = new WebSocket(WEBSOCKET_URL);
 
   ws.value.onopen = () => {
+    startHeartbeat(); // <--- 在连接成功后启动心跳
+
     console.log("WebSocket 连接成功!");
     isDisconnected.value = false;
     reconnectAttempts.value = 0; // 重置重连计数器
-
+    clearTimeout(reconnectTimerId.value); // 清除可能存在的定时器
     // 如果 localStream 不存在，则初始化。否则直接加入房间。
     if (!localStream.value) {
       initLocalMedia();
@@ -157,7 +251,27 @@ const connectWebSocket = () => {
     }
   };
 
+  // --- 新增心跳函数 ---
+  const startHeartbeat = () => {
+    console.log('启动心跳机制...');
+    heartbeatIntervalId.value = setInterval(() => {
+      if (ws.value && ws.value.readyState === WebSocket.OPEN) {
+        // 发送 ping 消息
+        sendMessage({ type: 'ping' });
+      }
+    }, 30000); // 每 30 秒发送一次
+  };
+
+  const stopHeartbeat = () => {
+    console.log('停止心跳机制...');
+    if (heartbeatIntervalId.value) {
+      clearInterval(heartbeatIntervalId.value);
+      heartbeatIntervalId.value = null;
+    }
+  };
+
   ws.value.onclose = () => {
+    stopHeartbeat(); // <--- 在连接关闭时停止心跳
     if (isUnmounted) {
       console.log("组件已卸载，WebSocket 正常关闭。");
       return;
@@ -189,54 +303,68 @@ const handleDisconnection = () => {
     isDisconnected.value = true;
   }
   reconnectAttempts.value++;
-  connectWebSocket();
+  // 指数退避算法
+  const delay = Math.min(30000, 1000 * Math.pow(2, reconnectAttempts.value)); // 最长等待30秒
+  console.log(`第 ${reconnectAttempts.value} 次重连将在 ${delay / 1000} 秒后开始...`);
+
+  reconnectTimerId.value = setTimeout(connectWebSocket, delay);
 };
 
 // --- WebRTC 核心功能 ---
 const initLocalMedia = async () => {
   try {
-    localStream.value = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    // 高质量音频约束
+    const constraints = {
+      audio: {
+        sampleRate: 48000, // 高采样率
+        channelCount: 1,   // 单声道通常足够用于语音
+        echoCancellation: false, // 禁用可能降低质量的回声消除
+        noiseSuppression: false, // 禁用可能降低质量的噪声抑制
+        autoGainControl: false, // 禁用自动增益控制
+        sampleSize: 24,    // 更高的位深度
+        latency: 0.01      // 低延迟
+      },
+      video: false
+    };
+
+    localStream.value = await navigator.mediaDevices.getUserMedia(constraints);
+    
+    // 检查实际获得的音频参数
+    const audioTrack = localStream.value.getAudioTracks()[0];
+    const settings = audioTrack.getSettings();
+    console.log("实际音频设置:", {
+      sampleRate: settings.sampleRate,
+      channelCount: settings.channelCount,
+      sampleSize: settings.sampleSize,
+      latency: settings.latency
+    });
+    
     setupSpeechDetection();
     sendMessage({ type: 'user-joined' });
   } catch (error) {
     console.error("获取麦克风权限失败:", error);
-    alert("无法获取麦克风权限，语音聊天功能无法使用。");
+    
+    // 尝试回退到基本约束
+    try {
+      console.log("尝试使用基本约束...");
+      localStream.value = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      setupSpeechDetection();
+      sendMessage({ type: 'user-joined' });
+    } catch (fallbackError) {
+      console.error("获取基本麦克风权限失败:", fallbackError);
+      alert("无法获取麦克风权限，语音聊天功能无法使用。");
+    }
   }
 };
 
-const createPeerConnection = (peerId) => {
-  const pc = new RTCPeerConnection(pc_config);
-
-  pc.onicecandidate = (event) => {
-    if (event.candidate) {
-      sendMessage({ type: 'candidate', candidate: event.candidate, to: peerId });
-    }
-  };
-
-  pc.ontrack = (event) => {
-    if (peers.value[peerId] && event.streams && event.streams[0]) {
-      peers.value[peerId].audioEl.srcObject = event.streams[0];
-    }
-  };
-
+// 监听音频设备变化
+navigator.mediaDevices.addEventListener('devicechange', async () => {
+  console.log('音频设备发生变化，重新初始化...');
   if (localStream.value) {
-    localStream.value.getTracks().forEach(track => {
-      pc.addTrack(track, localStream.value);
-    });
+    localStream.value.getTracks().forEach(track => track.stop());
   }
-
-  // 新增：监控单个 peer 的连接状态
-  pc.oniceconnectionstatechange = () => {
-    console.log(`Peer ${peerId} ICE connection state: ${pc.iceConnectionState}`);
-    if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'closed') {
-      // 如果单个 peer 断开，可以尝试在这里处理它，或者依赖 WebSocket 的全局重连
-      // 为简化，我们主要依赖 WebSocket 的重连
-    }
-  };
-
-  peers.value[peerId] = { pc, audioEl: null };
-  return peers.value[peerId];
-};
+  await initLocalMedia();
+});
 
 // --- 清理和控制 ---
 const cleanupPeers = () => {
@@ -257,30 +385,96 @@ const toggleMute = () => {
   });
 };
 
-const setupSpeechDetection = () => {
-  // setupSpeechDetection 逻辑与之前版本相同
+const setupSpeechDetection = async () => {
   if (!localStream.value || !localStream.value.getAudioTracks().length) return;
-  audioContext = new (window.AudioContext || window.webkitAudioContext)();
-  analyser = audioContext.createAnalyser();
-  microphone = audioContext.createMediaStreamSource(localStream.value);
-  javascriptNode = audioContext.createScriptProcessor(2048, 1, 1);
-  analyser.smoothingTimeConstant = 0.8;
-  analyser.fftSize = 1024;
-  microphone.connect(analyser);
-  analyser.connect(javascriptNode);
-  javascriptNode.connect(audioContext.destination);
-  javascriptNode.onaudioprocess = () => {
-    const array = new Uint8Array(analyser.frequencyBinCount);
-    analyser.getByteFrequencyData(array);
-    let values = 0;
-    const length = array.length;
-    for (let i = 0; i < length; i++) {
-      values += (array[i]);
-    }
-    const average = values / length;
-    isSpeaking.value = average > 15;
-  };
+
+  try {
+    // 创建高配置的音频上下文
+    audioContext = new (window.AudioContext || window.webkitAudioContext)({
+      sampleRate: 48000, // 高采样率
+      latencyHint: 'playback' // 更高的延迟换取更好的质量
+    });
+
+    const microphone = audioContext.createMediaStreamSource(localStream.value);
+
+    // 添加高质量处理器
+    await audioContext.audioWorklet.addModule('/volume-processor.js');
+
+    const volumeNode = new AudioWorkletNode(
+      audioContext, 
+      'volume-processor',
+      {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1], // 单声道
+        processorOptions: {
+          sampleRate: 48000 // 传递采样率给处理器
+        }
+      }
+    );
+
+    // 设置高质量的分析节点
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 2048; // 更大的FFT窗口
+    analyser.smoothingTimeConstant = 0.8; // 更平滑的过渡
+    analyser.minDecibels = -90;
+    analyser.maxDecibels = -10;
+
+    volumeNode.port.onmessage = (event) => {
+      const { rms, peak, dynamicRange } = event.data;
+      // 使用更精确的检测逻辑
+      isSpeaking.value = rms > 0.02 || peak > 0.1;
+      
+      // 可以在这里添加更多音频质量监控逻辑
+      console.debug(`音频质量: RMS=${rms.toFixed(4)}, Peak=${peak.toFixed(4)}, DynamicRange=${dynamicRange.toFixed(2)}dB`);
+    };
+
+    // 连接链: 麦克风 -> 音量处理器 -> 分析器 -> 目的地
+    microphone.connect(volumeNode)
+              .connect(analyser)
+              .connect(audioContext.destination);
+
+  } catch (e) {
+    console.error("设置高质量音频失败:", e);
+    // 回退到基本设置
+    setupBasicSpeechDetection();
+  }
 };
+
+// 基本语音检测作为回退方案
+const setupBasicSpeechDetection = () => {
+  if (!localStream.value) return;
+  
+  try {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const microphone = audioContext.createMediaStreamSource(localStream.value);
+    
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 256;
+    
+    const javascriptNode = audioContext.createScriptProcessor(2048, 1, 1);
+    
+    javascriptNode.onaudioprocess = () => {
+      const array = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(array);
+      
+      let sum = 0;
+      for (let i = 0; i < array.length; i++) {
+        sum += array[i];
+      }
+      
+      const avg = sum / array.length;
+      isSpeaking.value = avg > 20; // 基本阈值
+    };
+    
+    microphone.connect(analyser);
+    analyser.connect(javascriptNode);
+    javascriptNode.connect(audioContext.destination);
+  } catch (e) {
+    console.error("设置基本语音检测失败:", e);
+  }
+};
+
 
 // --- Vue 生命周期钩子 ---
 onMounted(() => {
@@ -291,7 +485,10 @@ onMounted(() => {
 onUnmounted(() => {
   isUnmounted = true;
   console.log("组件正在卸载，开始清理资源...");
-
+  // 清理重连定时器
+  if (reconnectTimerId.value) {
+    clearTimeout(reconnectTimerId.value);
+  }
 
   // 正常关闭 WebSocket 连接
   if (ws.value && ws.value.readyState === WebSocket.OPEN) {
