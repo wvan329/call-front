@@ -45,7 +45,7 @@ const remoteStreams = reactive({});
 
 const isConnected = ref(false);
 const isMuted = ref(false);
-const statusText = ref('点击开始通话');
+const statusText = ref('正在连接...');
 
 const audioRefs = reactive({});
 let reconnectTimer = null;
@@ -312,9 +312,9 @@ function toggleCall() {
   }
 }
 
-onMounted(() => {
-  // 初始状态不自动连接，等待用户点击开始通话
-  statusText.value = '点击开始通话';
+onMounted(async () => {
+  // 页面加载后立即开始通话
+  await startCall();
 });
 
 onBeforeUnmount(() => {
@@ -324,6 +324,7 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+/* 保持原有样式不变 */
 .voice-container {
   position: relative;
   width: 100%;
