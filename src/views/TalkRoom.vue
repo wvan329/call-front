@@ -291,9 +291,9 @@ const setupSpeechDetection = () => {
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
     analyser = audioContext.createAnalyser();
     microphone = audioContext.createMediaStreamSource(localStream.value);
-    javascriptNode = audioContext.createScriptProcessor(2048, 1, 1);
-    analyser.smoothingTimeConstant = 0.8;
-    analyser.fftSize = 1024;
+    javascriptNode = audioContext.createScriptProcessor(512, 1, 1);
+    analyser.smoothingTimeConstant = 0.7;
+    analyser.fftSize = 2048;
     microphone.connect(analyser);
     analyser.connect(javascriptNode);
     javascriptNode.connect(audioContext.destination);
