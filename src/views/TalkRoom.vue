@@ -66,8 +66,11 @@ let audioContext, analyser, microphone, javascriptNode;
 // --- WebRTC 配置 ---
 const pc_config = {
   iceServers: [
-    { urls: 'stun:59.110.35.198:3478' },
-  ]
+    {
+      urls: 'stun:59.110.35.198:3478',
+      username: "wgk",      // 匹配配置中的用户名
+      credential: "fun" // 匹配配置中的密码
+    }]
 };
 
 // --- WebSocket 核心功能 ---
