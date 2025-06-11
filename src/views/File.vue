@@ -454,214 +454,6 @@ const handleSignalingCandidate = async (candidate, peerId) => {
     }
   }
 };
-
-// --- File Sending Logic ---
-const handleFileSelection = (event) => {
-  selectedFile.value = event.target.files[0];
-  errorMessage.value = '';
-  sendProgress.value = 0;
-  totalBytesSent.value = 0;
-  currentSendSpeed.value = 0;
-  isTransferring.value = false;
-  // Clear any existing transfers if a new file is selected
-  for(const fileId in outgoingTransfers) {
-    const transfer = outgoingTransfers[fileId];
-    if(!transfer.isComplete && transfer.reject) {
-      transfer.reject(new Error('New file selected, transfer cancelled.'));
-    }
-    delete outgoingTransfers[fileId];
-  }
-};
-
-const startFileTransfer = async () => {
-  if (!selectedFile.value) {
-    errorMessage.value = '请先选择文件！';
-    return;
-  }
-  const activePeers = Object.keys(peerConnections).filter(id => peerConnections[id].status === 'connected' && peerConnections[id].dataChannel?.readyState === 'open');
-
-  if (activePeers.length === 0) {
-    errorMessage.value = '没有可用的对等连接！';
-    isTransferring.value = false; // Reset if no peers
-    return;
-  }
-
-  isTransferring.value = true;
-  errorMessage.value = '';
-  totalBytesSent.value = 0;
-  lastSpeedCalcTime.value = Date.now();
-  lastBytesSentForSpeed.value = 0;
-  currentSendSpeed.value = 0;
-  sendProgress.value = 0;
-  startUiUpdateTimer(); // Start UI update timer
-
-  const file = selectedFile.value;
-  const fileId = generateUniqueId();
-  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-
-  // Initialize outgoing transfer state
-  outgoingTransfers[fileId] = {
-    file,
-    fileId,
-    totalChunks,
-    sentChunks: new Set(), // Chunks sent for the first time
-    ackedChunks: new Set(), // Chunks acknowledged by receiver
-    pendingAcks: new Map(), // { chunkIndex: { timestamp, retries, data } }
-    peers: {}, // { peerId: { reader, readerBusy, readerQueue: [{chunkIndex, slice}], isPeerComplete } }
-    transferStartTime: Date.now(),
-    isComplete: false,
-    resolve: null,
-    reject: null
-  };
-
-  const transferPromise = new Promise((resolve, reject) => {
-    outgoingTransfers[fileId].resolve = resolve;
-    outgoingTransfers[fileId].reject = reject;
-  });
-
-  // Prepare transfer for each connected peer
-  activePeers.forEach(peerId => {
-    const peerTransfer = {
-      reader: new FileReader(), // Dedicated FileReader per peer
-      readerBusy: false,
-      readerQueue: [], // Queue for chunks to be read by this peer's FileReader
-      isPeerComplete: false,
-      lastAckTime: Date.now() // For peer health check (optional)
-    };
-    outgoingTransfers[fileId].peers[peerId] = peerTransfer;
-
-    // Set up FileReader handlers once
-    peerTransfer.reader.onload = (e) => {
-      peerTransfer.readerBusy = false;
-      const { chunkIndex, originalSliceSize, packet } = peerTransfer.readerQueue.shift(); // Get the completed chunk info
-
-      // Update total bytes sent as soon as it's READ into memory
-      // We do this here instead of after dc.send to account for FileReader latency.
-      totalBytesSent.value += originalSliceSize;
-
-      const dc = peerConnections[peerId]?.dataChannel;
-      if (dc?.readyState === 'open' && dc.bufferedAmount < MAX_BUFFERED_AMOUNT) {
-        try {
-          dc.send(packet);
-          // console.log(`Sent chunk ${chunkIndex} for file ${fileId} to ${peerId}`);
-          outgoingTransfers[fileId].sentChunks.add(chunkIndex);
-          outgoingTransfers[fileId].pendingAcks.set(chunkIndex, {
-            timestamp: Date.now(),
-            retries: 0,
-            data: packet // Store the packet for retransmission
-          });
-        } catch (sendError) {
-          console.error(`Error sending chunk ${chunkIndex} to ${peerId}:`, sendError);
-          // This typically means the DC is closed/failing.
-          closePeerConnection(peerId);
-        }
-      } else {
-        // If DC is not open or buffer is full, put it back to re-queue (or handle as error)
-        // For simplicity, we assume processOutgoingQueue will pick it up on onbufferedamountlow
-        // If this happens often, we might need a more sophisticated retry for the send part.
-        console.warn(`DC not ready or buffer full for ${peerId} after reading chunk ${chunkIndex}.`);
-      }
-      processOutgoingQueue(fileId, peerId); // Try to read next chunk or send
-    };
-
-    peerTransfer.reader.onerror = (e) => {
-      peerTransfer.readerBusy = false;
-      console.error(`FileReader error for ${peerId}:`, e.target.error);
-      // Mark peer transfer as failed
-      peerTransfer.isPeerComplete = true;
-      errorMessage.value = `文件读取失败: ${e.target.error.message}`;
-      if (outgoingTransfers[fileId].reject) outgoingTransfers[fileId].reject(e.target.error);
-    };
-
-    // Send initial metadata
-    const dc = peerConnections[peerId]?.dataChannel;
-    if (dc?.readyState === 'open') {
-      sendMetaData(dc, fileId, file.name, file.size, file.type || 'application/octet-stream');
-      processOutgoingQueue(fileId, peerId); // Start sending if DC is open
-    } else {
-      console.log(`DC not open for ${peerId}, metadata and chunks will be sent when DC opens.`);
-    }
-  });
-
-  try {
-    await transferPromise;
-    console.log('File transfer completed successfully!');
-    errorMessage.value = ''; // Clear any previous errors
-    sendProgress.value = 100;
-  } catch (error) {
-    console.error('File transfer failed:', error);
-    errorMessage.value = `文件传输失败: ${error.message}`;
-    // Keep progress at current state or reset based on UX choice
-  } finally {
-    isTransferring.value = false;
-    stopUiUpdateTimer();
-    // Only delete after a short delay if needed, or if a new transfer starts
-    // delete outgoingTransfers[fileId]; // Clean up the transfer object
-  }
-};
-
-// Process the outgoing queue for a specific file and peer
-const processOutgoingQueue = (fileId, peerId) => {
-  const transfer = outgoingTransfers[fileId];
-  if (!transfer || transfer.isComplete) return;
-
-  const peerTransfer = transfer.peers[peerId];
-  if (!peerTransfer || peerTransfer.isPeerComplete) return;
-
-  const peerConn = peerConnections[peerId];
-  const dc = peerConn?.dataChannel;
-
-  if (!dc || dc.readyState !== 'open') {
-    // console.log(`DataChannel to ${peerId} not open, cannot send.`);
-    return;
-  }
-
-  // --- 1. Check for space in DataChannel buffer ---
-  // Only proceed if there's enough buffer space AND FileReader is not busy
-  if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-    // console.log(`Buffered amount for ${peerId} is high: ${formatBytes(dc.bufferedAmount)}`);
-    return; // Wait for onbufferedamountlow
-  }
-
-  // --- 2. Feed FileReader queue if not busy ---
-  if (!peerTransfer.readerBusy && peerTransfer.readerQueue.length === 0) {
-    // Find the next unacked chunk that hasn't been sent for the first time yet
-    // Or a chunk that is pending ACK and needs retransmission (covered by timer)
-    let nextChunkIndex = -1;
-    for (let i = 0; i < transfer.totalChunks; i++) {
-      if (!transfer.ackedChunks.has(i) && !transfer.pendingAcks.has(i)) {
-        nextChunkIndex = i;
-        break;
-      }
-    }
-
-    if (nextChunkIndex !== -1) {
-      const start = nextChunkIndex * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, transfer.file.size);
-      const slice = transfer.file.slice(start, end);
-
-      const packet = createDataPacket(transfer.fileId, nextChunkIndex, null); // Payload is null for now
-      peerTransfer.readerQueue.push({ chunkIndex: nextChunkIndex, originalSliceSize: slice.size, packet });
-
-      peerTransfer.readerBusy = true;
-      peerTransfer.reader.readAsArrayBuffer(slice); // This is asynchronous
-      // console.log(`Queued chunk ${nextChunkIndex} for FileReader of ${peerId}`);
-      // Don't call processOutgoingQueue immediately, wait for FileReader.onload
-      return; // Exit, wait for reader to complete
-    }
-  }
-
-  // --- 3. Check for completion ---
-  // If all chunks sent and acknowledged by THIS peer, mark as complete for this peer
-  if (transfer.ackedChunks.size === transfer.totalChunks && !peerTransfer.isPeerComplete) {
-    sendCompletionMessage(dc, fileId);
-    peerTransfer.isPeerComplete = true;
-    console.log(`File ${fileId} transfer completed for peer ${peerId}`);
-    // Check if the overall transfer is complete for all peers
-    checkOverallTransferCompletion(fileId);
-  }
-};
-
 const createDataPacket = (fileId, chunkIndex, chunkData) => {
   // Packet format: [fileId_length (1 byte)] + [fileId (variable)] + [chunkIndex (4 bytes)] + [chunkData]
   const fileIdBytes = new TextEncoder().encode(fileId);
@@ -941,6 +733,223 @@ const sendMetaData = (dc, fileId, name, size, type) => {
     console.error('Error sending metadata:', e);
   }
 };
+
+
+const handleFileSelection = (event) => {
+  selectedFile.value = event.target.files[0];
+  errorMessage.value = '';
+  sendProgress.value = 0;
+  totalBytesSent.value = 0;
+  currentSendSpeed.value = 0;
+  isTransferring.value = false;
+  // Clear any existing transfers if a new file is selected
+  for(const fileId in outgoingTransfers) {
+    const transfer = outgoingTransfers[fileId];
+    if(!transfer.isComplete && transfer.reject) {
+      transfer.reject(new Error('New file selected, transfer cancelled.'));
+    }
+    delete outgoingTransfers[fileId];
+  }
+};
+
+const startFileTransfer = async () => {
+  if (!selectedFile.value) {
+    errorMessage.value = '请先选择文件！';
+    return;
+  }
+  const activePeers = Object.keys(peerConnections).filter(id => peerConnections[id].status === 'connected' && peerConnections[id].dataChannel?.readyState === 'open');
+
+  if (activePeers.length === 0) {
+    errorMessage.value = '没有可用的对等连接！';
+    isTransferring.value = false; // Reset if no peers
+    return;
+  }
+
+  isTransferring.value = true;
+  errorMessage.value = '';
+  totalBytesSent.value = 0;
+  lastSpeedCalcTime.value = Date.now();
+  lastBytesSentForSpeed.value = 0;
+  currentSendSpeed.value = 0;
+  sendProgress.value = 0;
+  startUiUpdateTimer(); // Start UI update timer
+
+  const file = selectedFile.value;
+  const fileId = generateUniqueId();
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+  // Initialize outgoing transfer state
+  outgoingTransfers[fileId] = {
+    file,
+    fileId,
+    totalChunks,
+    sentChunks: new Set(), // Chunks sent for the first time
+    ackedChunks: new Set(), // Chunks acknowledged by receiver
+    pendingAcks: new Map(), // { chunkIndex: { timestamp, retries, data } }
+    peers: {}, // { peerId: { reader, readerBusy, readerQueue: [], isPeerComplete, ... } }
+    transferStartTime: Date.now(),
+    isComplete: false,
+    resolve: null,
+    reject: null
+  };
+
+  const transferPromise = new Promise((resolve, reject) => {
+    outgoingTransfers[fileId].resolve = resolve;
+    outgoingTransfers[fileId].reject = reject;
+  });
+
+  // Prepare transfer for each connected peer
+  activePeers.forEach(peerId => {
+    const peerTransfer = {
+      reader: new FileReader(), // Dedicated FileReader per peer
+      readerBusy: false,
+      // readerQueue 将只存储 { chunkIndex, originalSliceSize }，不存储不完整的 packet
+      readerQueue: [], // Queue for chunks to be read by this peer's FileReader
+      isPeerComplete: false,
+      lastAckTime: Date.now() // For peer health check (optional)
+    };
+    outgoingTransfers[fileId].peers[peerId] = peerTransfer;
+
+    // Set up FileReader handlers once
+    peerTransfer.reader.onload = (e) => {
+      peerTransfer.readerBusy = false;
+      // 从队列中取出对应的块信息（不再有 `packet` 字段）
+      const { chunkIndex, originalSliceSize } = peerTransfer.readerQueue.shift();
+
+      // FileReader 读取到的实际 ArrayBuffer 数据
+      const chunkDataArrayBuffer = e.target.result;
+
+      // ****** 核心改动在这里：使用真实的 chunkDataArrayBuffer 来构建完整的包 ******
+      const fullPacket = createDataPacket(transfer.fileId, chunkIndex, chunkDataArrayBuffer);
+
+      const dc = peerConnections[peerId]?.dataChannel;
+      if (dc?.readyState === 'open' && dc.bufferedAmount < MAX_BUFFERED_AMOUNT) {
+        try {
+          dc.send(fullPacket); // 发送包含实际数据的完整包
+          // console.log(`Sent chunk ${chunkIndex} for file ${fileId} to ${peerId} (size: ${chunkDataArrayBuffer.byteLength})`);
+
+          outgoingTransfers[fileId].sentChunks.add(chunkIndex);
+          outgoingTransfers[fileId].pendingAcks.set(chunkIndex, {
+            timestamp: Date.now(),
+            retries: 0,
+            data: fullPacket // 重传时也使用完整包
+          });
+          // 仅在成功发送到 DataChannel 缓冲区后才更新发送字节数，更准确反映网络吞吐
+          totalBytesSent.value += originalSliceSize;
+
+        } catch (sendError) {
+          console.error(`Error sending chunk ${chunkIndex} to ${peerId}:`, sendError);
+          // 如果 DataChannel 发生错误，关闭 PeerConnection，触发清理
+          closePeerConnection(peerId);
+        }
+      } else {
+        // 如果 DataChannel 未打开或缓冲区已满，无法立即发送。
+        // 这个 chunk 已经读取但尚未发送，它会在下一次 processOutgoingQueue 尝试时被重新处理。
+        console.warn(`DataChannel not ready or buffer full for ${peerId} after reading chunk ${chunkIndex}. This chunk might be delayed.`);
+      }
+      processOutgoingQueue(fileId, peerId); // 尝试读取下一个分块或处理待发队列
+    };
+
+    peerTransfer.reader.onerror = (e) => {
+      peerTransfer.readerBusy = false;
+      console.error(`FileReader error for ${peerId}:`, e.target.error);
+      peerTransfer.isPeerComplete = true; // 标记此 peer 的传输已完成（因错误）
+      errorMessage.value = `文件读取失败: ${e.target.error.message}`;
+      if (outgoingTransfers[fileId].reject) outgoingTransfers[fileId].reject(e.target.error);
+      outgoingTransfers[fileId].isComplete = true; // 标记整个文件传输失败
+    };
+
+    // Send initial metadata
+    const dc = peerConnections[peerId]?.dataChannel;
+    if (dc?.readyState === 'open') {
+      sendMetaData(dc, fileId, file.name, file.size, file.type || 'application/octet-stream');
+      // 首次连接时，尝试启动数据发送
+      processOutgoingQueue(fileId, peerId);
+    } else {
+      console.log(`DC not open for ${peerId}, metadata and chunks will be sent when DC opens.`);
+    }
+  });
+
+  try {
+    await transferPromise;
+    console.log('File transfer completed successfully!');
+    errorMessage.value = ''; // Clear any previous errors
+    sendProgress.value = 100;
+  } catch (error) {
+    console.error('File transfer failed:', error);
+    errorMessage.value = `文件传输失败: ${error.message}`;
+    // Keep progress at current state or reset based on UX choice
+  } finally {
+    isTransferring.value = false;
+    stopUiUpdateTimer();
+    // 只在新的文件传输开始或手动清理时才删除 transfer 对象
+    // delete outgoingTransfers[fileId]; // 暂时不在这里删除，以防需要检查状态
+  }
+};
+
+// Process the outgoing queue for a specific file and peer
+const processOutgoingQueue = (fileId, peerId) => {
+  const transfer = outgoingTransfers[fileId];
+  if (!transfer || transfer.isComplete) return;
+
+  const peerTransfer = transfer.peers[peerId];
+  if (!peerTransfer || peerTransfer.isPeerComplete) return;
+
+  const peerConn = peerConnections[peerId];
+  const dc = peerConn?.dataChannel;
+
+  if (!dc || dc.readyState !== 'open') {
+    // console.log(`DataChannel to ${peerId} not open, cannot send.`);
+    return;
+  }
+
+  // --- 1. Check for space in DataChannel buffer ---
+  // 只有当缓冲区有空间且 FileReader 不忙时才继续
+  if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+    // console.log(`Buffered amount for ${peerId} is high: ${formatBytes(dc.bufferedAmount)}`);
+    return; // 等待 onbufferedamountlow 事件
+  }
+
+  // --- 2. 尝试喂给 FileReader 队列（如果它不忙） ---
+  if (!peerTransfer.readerBusy && peerTransfer.readerQueue.length === 0) {
+    // 找到下一个尚未被确认且当前没有正在被发送的块
+    let nextChunkIndex = -1;
+    for (let i = 0; i < transfer.totalChunks; i++) {
+      // 检查：1. 尚未被接收端确认； 2. 尚未处于待确认状态（即尚未发送）
+      if (!transfer.ackedChunks.has(i) && !transfer.pendingAcks.has(i)) {
+        nextChunkIndex = i;
+        break;
+      }
+    }
+
+    if (nextChunkIndex !== -1) {
+      const start = nextChunkIndex * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, transfer.file.size);
+      const slice = transfer.file.slice(start, end);
+
+      // ****** 核心改动在这里：只推送 chunkIndex 和 originalSliceSize ******
+      peerTransfer.readerQueue.push({ chunkIndex: nextChunkIndex, originalSliceSize: slice.size });
+
+      peerTransfer.readerBusy = true;
+      peerTransfer.reader.readAsArrayBuffer(slice); // 异步读取文件切片
+      // console.log(`Queued chunk ${nextChunkIndex} for FileReader of ${peerId}`);
+      return; // 立即返回，等待 FileReader.onload 回调完成后再继续处理
+    }
+  }
+
+  // --- 3. 检查是否完成 ---
+  // 如果所有分块都已发送并被此对等端确认，则标记此对等端传输完成
+  if (transfer.ackedChunks.size === transfer.totalChunks && !peerTransfer.isPeerComplete) {
+    sendCompletionMessage(dc, fileId);
+    peerTransfer.isPeerComplete = true;
+    console.log(`File ${fileId} transfer completed for peer ${peerId}`);
+    // 检查整体传输是否对所有对等端都已完成
+    checkOverallTransferCompletion(fileId);
+  }
+};
+
+
+
 
 
 const processIncomingChunk = (chunkData, peerId) => {
