@@ -94,6 +94,15 @@ const formatBytes = (bytes, decimals = 2) => {
     }, 30000); // 每 30 秒发送一次
   };
 
+
+  const sendMessage = (message) => {
+  if (ws.value && ws.value.readyState === WebSocket.OPEN) {
+    ws.value.send(JSON.stringify(message));
+  } else {
+    console.error("无法发送消息，WebSocket 未连接。");
+  }
+};
+
     const stopHeartbeat = () => {
     console.log('停止心跳机制...');
     if (heartbeatIntervalId.value) {
