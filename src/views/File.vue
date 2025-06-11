@@ -226,7 +226,7 @@ const sendFileToPeer = (peerId, file) => {
   
   return Promise.all(transferPromises);
 };
-
+ 
 // 增强的 closePeerConnection
 const closePeerConnection = (peerId) => {
   if (!peerConnections[peerId]) return;
