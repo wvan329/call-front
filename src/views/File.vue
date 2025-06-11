@@ -991,6 +991,24 @@ onUnmounted(() => {
     if (file.url) URL.revokeObjectURL(file.url);
   });
 });
+
+// Utility function to send file metadata
+const sendMetaData = (dc, fileId, name, size, type) => {
+  const metadata = {
+    type: 'file-metadata',
+    fileId: fileId,
+    name: name,
+    size: size,
+    fileType: type,
+    chunkSize: CHUNK_SIZE // Inform receiver about chunk size
+  };
+  try {
+    dc.send(JSON.stringify(metadata));
+    console.log(`Sent metadata for file ${fileId} (${name}) to peer via DataChannel.`);
+  } catch (e) {
+    console.error('Error sending metadata:', e);
+  }
+};
 </script>
 
 <style scoped>
