@@ -22,7 +22,7 @@
         <li v-for="(file, index) in receivedFiles" :key="index" class="received-file-item">
           <p>
             <span class="file-info">From: {{ file.from }} - **{{ file.fileName }}** ({{ formatBytes(file.fileSize) }})</span>
-            <a :href="file.url" :download="file.metadata.fileName" class="download-link">Download</a>
+            <a :href="file.url" :download="file.fileName" class="download-link">Download</a>
             <div v-if="file.progress < 100" class="progress-bar-container">
               <div class="progress-bar" :style="{ width: file.progress + '%' }"></div>
               <span>{{ file.progress.toFixed(1) }}%</span>
