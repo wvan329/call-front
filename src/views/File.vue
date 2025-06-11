@@ -61,7 +61,7 @@ const sendFileError = ref('');
 const availableSessions = ref([]); // To store other connected session IDs for point-to-point
 const selectedRecipientId = ref(''); // For selecting a specific recipient
 
-const wsUrl = 'ws://localhost:8080/ws'; // Adjust if your WebSocket endpoint is different
+const wsUrl = 'ws://59.110.35.198/wgk/ws'; // Adjust if your WebSocket endpoint is different
 
 // Helper to format file size
 const formatBytes = (bytes, decimals = 2) => {
