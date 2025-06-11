@@ -63,7 +63,7 @@ const RTC_CONFIG = {
 // --- File Transfer Constants ---
 const CHUNK_SIZE = 16 * 1024;
 
-const wsUrl = 'ws://59.110.35.198/wgk/ws'; // Your WebSocket signaling server URL
+const wsUrl = 'ws://59.110.35.198/wgk/ws/file'; // Your WebSocket signaling server URL
 
 const canBroadcastFile = computed(() => {
   return Object.values(peerConnections).some(pcInfo => pcInfo.dc && pcInfo.dc.readyState === 'open');
