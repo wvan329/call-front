@@ -29,13 +29,12 @@ onMounted(() => {
   }
 })
 
-// 建立连接 & 发送 offer
 async function sendFile() {
   if (!file.value) return
   for (const userId of onlineUsers.value) {
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
     const dc = pc.createDataChannel('file')
-    setupDataChannel(dc)
+    setupReceiverDataChannel(dc)
 
     pc.onicecandidate = ({ candidate }) => {
       if (candidate) {
@@ -45,49 +44,35 @@ async function sendFile() {
 
     const offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
-
+    ws.value.send(JSON.stringify({ type: 'offer', to: userId, desc: offer }))
     peers.value[userId] = { pc, dc }
 
-    ws.value.send(JSON.stringify({ type: 'offer', to: userId, desc: offer }))
-
-    // 控制速率发送文件（每 50ms 一块）
-    const chunkSize = 16 * 1024
+    // 控制发送速率：最大吞吐策略
     const reader = file.value.stream().getReader()
+    const MAX_BUFFER = 16 * 1024 * 1024 // 16MB
 
-    async function sendChunk() {
-      const { value, done } = await reader.read()
-      if (done) return dc.send('EOF')
-      if (dc.bufferedAmount > 16 * 1024 * 1024) {
-        setTimeout(sendChunk, 100)
-      } else {
+    async function sendChunks() {
+      let { value, done } = await reader.read()
+      while (!done) {
+        if (dc.bufferedAmount > MAX_BUFFER) {
+          await new Promise(res => setTimeout(res, 10))
+          continue
+        }
         dc.send(value)
-        setTimeout(sendChunk, 50)
+        ;({ value, done } = await reader.read())
       }
+      dc.send('EOF')
     }
-    sendChunk()
+
+    dc.onopen = () => sendChunks()
   }
 }
 
-// 接收 offer，创建 answer 和 dataChannel
 async function handleOffer(msg) {
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
-  peers.value[msg.from] = { pc, dc: null }
+  peers.value[msg.from] = { pc }
 
-  pc.ondatachannel = (e) => {
-    const chunks = []
-    const dc = e.channel
-    dc.onmessage = (ev) => {
-      if (ev.data === 'EOF') {
-        const blob = new Blob(chunks)
-        const a = document.createElement('a')
-        a.href = URL.createObjectURL(blob)
-        a.download = 'received_' + Date.now()
-        a.click()
-      } else {
-        chunks.push(ev.data)
-      }
-    }
-  }
+  pc.ondatachannel = (e) => setupReceiverDataChannel(e.channel)
 
   pc.onicecandidate = ({ candidate }) => {
     if (candidate) {
@@ -98,19 +83,29 @@ async function handleOffer(msg) {
   await pc.setRemoteDescription(msg.desc)
   const answer = await pc.createAnswer()
   await pc.setLocalDescription(answer)
-
   ws.value.send(JSON.stringify({ type: 'answer', to: msg.from, desc: answer }))
 }
 
-function setupDataChannel(dc) {
-  dc.onopen = () => console.log('DataChannel open')
+function setupReceiverDataChannel(dc) {
+  const chunks = []
+  dc.onmessage = (e) => {
+    if (e.data === 'EOF') {
+      const blob = new Blob(chunks)
+      const a = document.createElement('a')
+      a.href = URL.createObjectURL(blob)
+      a.download = 'received_' + Date.now()
+      a.click()
+    } else {
+      chunks.push(e.data)
+    }
+  }
 }
 </script>
 
 <template>
   <div class="p-4 space-y-4">
     <input type="file" @change="e => file.value = e.target.files[0]" />
-    <button @click="sendFile" class="px-4 py-2 bg-blue-500 text-white rounded">发送文件</button>
+    <button @click="sendFile" class="px-4 py-2 bg-blue-600 text-white rounded">发送文件</button>
     <p>在线用户：{{ onlineUsers }}</p>
   </div>
 </template>
