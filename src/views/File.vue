@@ -5,7 +5,7 @@
     <div class="file-transfer-section">
       <h3>选择文件</h3>
       <input type="file" @change="handleFileChange" ref="fileInput" />
-      <button @click="sendFileBroadcast" :disabled="!selectedFile || !canBroadcastFile">
+      <button @click="sendFileBroadcast" :disabled="!selectedFile">
         Broadcast File
       </button>
       <p v-if="selectedFile">Selected: {{ selectedFile.name }} ({{ formatBytes(selectedFile.size) }})</p>
