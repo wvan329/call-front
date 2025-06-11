@@ -25,32 +25,22 @@ onMounted(() => {
   ws.value.onmessage = async (e) => {
     const msg = JSON.parse(e.data)
     switch (msg.type) {
-      case 'session-id':
-        selfId.value = msg.id
-        break
-      case 'user-list':
-        onlineUsers.value = msg.users.filter(id => id !== selfId.value)
-        break
       case 'offer':
         await handleOffer(msg)
         break
       case 'answer':
         if (peers.value[msg.from]) {
-          await peers.value[msg.from].pc.setRemoteDescription(new RTCSessionDescription(msg.desc))
-        }
-        break
-      case 'candidate':
-        const peer = peers.value[msg.from]
-        if (peer) {
-          if (peer.pc.remoteDescription) {
-            await peer.pc.addIceCandidate(msg.candidate)
+          if (msg.desc && msg.desc.type) {
+            await peers.value[msg.from].pc.setRemoteDescription(new RTCSessionDescription(msg.desc))
           } else {
-            peer.pendingCandidates.push(msg.candidate)
+            console.warn('Invalid answer desc', msg.desc)
           }
         }
         break
+      // 其他情况...
     }
   }
+
 })
 
 async function handleOffer(msg) {
@@ -150,47 +140,58 @@ async function sendFile() {
     const reader = file.value.stream().getReader()
     const MAX_BUFFER = 16 * 1024 * 1024
     let sentSize = 0
-
     dc.onopen = async () => {
-      // 先发元信息：文件名+大小
+      // 先发元信息
       dc.send(JSON.stringify({ type: 'meta', filename: file.value.name, size: fileSize }))
 
-      async function sendChunks() {
-        let { value, done } = await reader.read()
-        while (!done) {
-          if (dc.bufferedAmount > MAX_BUFFER) {
-            await new Promise(res => setTimeout(res, 10))
-          } else {
-            dc.send(value)
-            sentSize += value.byteLength || value.length
-            sendProgress.value = Math.min(100, Math.floor((sentSize / fileSize) * 100))
-            ;({ value, done } = await reader.read())
-          }
+      const reader = file.value.stream().getReader()
+      let sentSize = 0
+      let { value, done } = await reader.read()
+
+      while (!done) {
+        // 等待缓冲区空闲
+        while (dc.bufferedAmount > MAX_BUFFER) {
+          await new Promise(res => setTimeout(res, 10))
         }
+
+        // 确认 DataChannel 还是 open 状态
+        if (dc.readyState !== 'open') {
+          console.warn('DataChannel is not open anymore, stop sending')
+          break
+        }
+
+        dc.send(value)
+        sentSize += value.byteLength || value.length
+        sendProgress.value = Math.min(100, Math.floor((sentSize / fileSize) * 100))
+
+          ; ({ value, done } = await reader.read())
+      }
+
+      if (dc.readyState === 'open') {
         dc.send('EOF')
         sendProgress.value = 100
       }
-
-      sendChunks()
     }
+
   }
 }
 
 </script>
 
 <template>
-  <div class="p-4 space-y-4">
-    <input type="file" @change="handleFileChange" />
-    <button @click="sendFile" class="px-4 py-2 bg-blue-600 text-white rounded">发送文件</button>
+  <div>
     <p>在线用户：{{ onlineUsers }}</p>
-  </div>
-  <div class="mt-4">
-    <h3 class="font-bold">已接收文件：</h3>
-    <ul class="space-y-2">
+
+    <input type="file" @change="e => file.value = e.target.files[0]" />
+    <button @click="sendFile">发送文件</button>
+
+    <p>发送进度：{{ sendProgress }}%</p>
+    <p>接收进度：{{ receiveProgress }}%</p>
+
+    <h3>已接收文件：</h3>
+    <ul>
       <li v-for="file in receivedFiles" :key="file.url">
-        <a :href="file.url" :download="file.name" class="text-blue-600 underline">
-          {{ file.name }} ({{ (file.size / 1024).toFixed(1) }} KB)
-        </a>
+        <a :href="file.url" :download="file.name">{{ file.name }}</a>
       </li>
     </ul>
   </div>
