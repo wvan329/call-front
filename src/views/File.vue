@@ -56,11 +56,10 @@ import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue';
 // --- Configuration Constants ---
 const WS_URL = 'ws://59.110.35.198/wgk/ws/file';
 const ICE_SERVERS = [{ urls: 'stun:59.110.35.198:3478' }];
-// const CHUNK_SIZE = 64 * 1024; // Smaller chunks (e.g., 64KB-256KB) can be more responsive to congestion
-const CHUNK_SIZE = 16 * 1024; // 尝试使用 16KB
-const MAX_BUFFERED_AMOUNT = 16 * 1024 * 1024; // Increased to 16MB. This is crucial for speed.
+const CHUNK_SIZE = 64 * 1024; // Smaller chunks (e.g., 64KB-256KB) can be more responsive to congestion
+const MAX_BUFFERED_AMOUNT = 10 * 1024 * 1024; // Increased to 16MB. This is crucial for speed.
 const RETRANSMIT_TIMEOUT = 2000; // 2 seconds for retransmission timeout (increased)
-const MAX_RETRANSMITS = 10; // Max retries for a chunk (increased)
+const MAX_RETRANSMITS = 100; // Max retries for a chunk (increased)
 const HEARTBEAT_INTERVAL = 25000;
 const UI_UPDATE_INTERVAL = 100; // Update UI every 100ms
 
