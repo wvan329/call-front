@@ -861,6 +861,88 @@ const initiateIncomingFile = (metadata, peerId) => {
   }
 };
 
+
+const sendChunkAck = (fileId, chunkIndex, peerId) => {
+  const ackMsg = {
+    type: 'chunk-ack',
+    fileId,
+    chunkIndex
+  };
+  const dc = peerConnections[peerId]?.dataChannel;
+  if (dc?.readyState === 'open') {
+    try {
+      dc.send(JSON.stringify(ackMsg));
+      // console.log(`Sent ACK for chunk ${chunkIndex} of ${fileId} to ${peerId}`);
+    } catch (e) {
+      // console.error(`Error sending ACK for chunk ${chunkIndex} to ${peerId}:`, e);
+      // If ACK fails, the sender will retransmit.
+    }
+  }
+};
+
+const handleChunkAck = (fileId, chunkIndex, peerId) => {
+  const transfer = outgoingTransfers[fileId];
+  if (transfer) {
+    if (!transfer.ackedChunks.has(chunkIndex)) { // Only if this is a new ACK
+      transfer.ackedChunks.add(chunkIndex);
+      transfer.pendingAcks.delete(chunkIndex); // Remove from pending Acks
+      // console.log(`ACK received for chunk ${chunkIndex} of ${fileId} from ${peerId}`);
+      // Immediately try to send more if ACK frees up a slot
+      processOutgoingQueue(fileId, peerId);
+    }
+  }
+};
+
+
+
+// --- Lifecycle Hooks ---
+onMounted(() => {
+  connectWebSocket();
+  startRetransmissionTimer();
+});
+
+onUnmounted(() => {
+  stopHeartbeat();
+  stopRetransmissionTimer();
+  stopUiUpdateTimer();
+  if (ws.value) ws.value.close();
+  Object.keys(peerConnections).forEach(closePeerConnection);
+  // Revoke any created object URLs to free up memory
+  receivedFiles.forEach(file => {
+    if (file.url) URL.revokeObjectURL(file.url);
+  });
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+const sendMetaData = (dc, fileId, name, size, type) => {
+  const metadata = {
+    type: 'file-metadata',
+    fileId: fileId,
+    name: name,
+    size: size,
+    fileType: type,
+    chunkSize: CHUNK_SIZE // Inform receiver about chunk size
+  };
+  try {
+    dc.send(JSON.stringify(metadata));
+    console.log(`Sent metadata for file ${fileId} (${name}) to peer via DataChannel.`);
+  } catch (e) {
+    console.error('Error sending metadata:', e);
+  }
+};
+
+
 const processIncomingChunk = (chunkData, peerId) => {
   const view = new DataView(chunkData);
   let offset = 0;
@@ -901,41 +983,12 @@ const processIncomingChunk = (chunkData, peerId) => {
   sendChunkAck(fileId, chunkIndex, peerId);
 
   // Check if all chunks are received for this file
+  // IMPORTANT: Use >= for receivedSize check to account for potential byte-level differences
   if (file.receivedChunks.size === file.totalChunks && file.receivedSize >= file.size) {
-    finalizeIncomingFile(fileId, peerId);
+      finalizeIncomingFile(fileId, peerId);
   }
 };
 
-const sendChunkAck = (fileId, chunkIndex, peerId) => {
-  const ackMsg = {
-    type: 'chunk-ack',
-    fileId,
-    chunkIndex
-  };
-  const dc = peerConnections[peerId]?.dataChannel;
-  if (dc?.readyState === 'open') {
-    try {
-      dc.send(JSON.stringify(ackMsg));
-      // console.log(`Sent ACK for chunk ${chunkIndex} of ${fileId} to ${peerId}`);
-    } catch (e) {
-      // console.error(`Error sending ACK for chunk ${chunkIndex} to ${peerId}:`, e);
-      // If ACK fails, the sender will retransmit.
-    }
-  }
-};
-
-const handleChunkAck = (fileId, chunkIndex, peerId) => {
-  const transfer = outgoingTransfers[fileId];
-  if (transfer) {
-    if (!transfer.ackedChunks.has(chunkIndex)) { // Only if this is a new ACK
-      transfer.ackedChunks.add(chunkIndex);
-      transfer.pendingAcks.delete(chunkIndex); // Remove from pending Acks
-      // console.log(`ACK received for chunk ${chunkIndex} of ${fileId} from ${peerId}`);
-      // Immediately try to send more if ACK frees up a slot
-      processOutgoingQueue(fileId, peerId);
-    }
-  }
-};
 
 const finalizeIncomingFile = (fileId, peerId) => {
   const file = incomingFiles[fileId];
@@ -944,13 +997,19 @@ const finalizeIncomingFile = (fileId, peerId) => {
     return;
   }
 
-  // Verify all chunks received
-  if (file.receivedChunks.size < file.totalChunks || file.receivedSize < file.size) {
-    console.warn(`Attempted to finalize file ${file.name} but not all chunks received yet. Received: ${file.receivedChunks.size}/${file.totalChunks}`);
-    // This can happen if file-transfer-complete arrives before all chunks due to out-of-band message.
-    // We can retry finalization or decide if this is an error state. For now, it will wait for all chunks.
-    return;
+  // Validate that we indeed have all chunks, and received size matches total size
+  // This check is slightly relaxed to allow for minor calculation discrepancies
+  const expectedTotalBytes = file.size;
+  const actualReceivedBytes = Array.from(file.receivedChunks.values()).reduce((sum, chunk) => sum + chunk.byteLength, 0);
+
+  if (file.receivedChunks.size !== file.totalChunks || actualReceivedBytes < expectedTotalBytes) {
+      console.warn(`Attempted to finalize file ${file.name} but not all chunks received or size mismatch.
+      Received chunks count: ${file.receivedChunks.size}/${file.totalChunks},
+      Received bytes: ${actualReceivedBytes}/${expectedTotalBytes}.`);
+      errorMessage.value = `文件接收不完整：分块数量或大小不匹配。`;
+      return; // Stop if critical chunk is missing or size mismatch
   }
+
 
   // Reconstruct the file
   const sortedChunks = [];
@@ -972,42 +1031,6 @@ const finalizeIncomingFile = (fileId, peerId) => {
 
   // Optionally revoke previous URLs if the file is updated or re-received
   // For simplicity, we just create a new one.
-};
-
-// --- Lifecycle Hooks ---
-onMounted(() => {
-  connectWebSocket();
-  startRetransmissionTimer();
-});
-
-onUnmounted(() => {
-  stopHeartbeat();
-  stopRetransmissionTimer();
-  stopUiUpdateTimer();
-  if (ws.value) ws.value.close();
-  Object.keys(peerConnections).forEach(closePeerConnection);
-  // Revoke any created object URLs to free up memory
-  receivedFiles.forEach(file => {
-    if (file.url) URL.revokeObjectURL(file.url);
-  });
-});
-
-// Utility function to send file metadata
-const sendMetaData = (dc, fileId, name, size, type) => {
-  const metadata = {
-    type: 'file-metadata',
-    fileId: fileId,
-    name: name,
-    size: size,
-    fileType: type,
-    chunkSize: CHUNK_SIZE // Inform receiver about chunk size
-  };
-  try {
-    dc.send(JSON.stringify(metadata));
-    console.log(`Sent metadata for file ${fileId} (${name}) to peer via DataChannel.`);
-  } catch (e) {
-    console.error('Error sending metadata:', e);
-  }
 };
 </script>
 
