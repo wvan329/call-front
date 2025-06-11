@@ -15,25 +15,45 @@ onMounted(() => {
 
   ws.value.onmessage = async (e) => {
     const msg = JSON.parse(e.data)
-    if (msg.type === 'session-id') {
-      selfId.value = msg.id
-    } else if (msg.type === 'user-list') {
-      onlineUsers.value = msg.users.filter(id => id !== selfId.value)
-    } else if (msg.type === 'offer') {
-      handleOffer(msg)
-    } else if (msg.type === 'answer') {
-      await peers.value[msg.from].pc.setRemoteDescription(msg.desc)
-    } else if (msg.type === 'candidate') {
-      await peers.value[msg.from].pc.addIceCandidate(msg.candidate)
+    switch (msg.type) {
+      case 'session-id':
+        selfId.value = msg.id
+        break
+      case 'user-list':
+        onlineUsers.value = msg.users.filter(id => id !== selfId.value)
+        break
+      case 'offer':
+        await handleOffer(msg)
+        break
+      case 'answer':
+        if (peers.value[msg.from]) {
+          await peers.value[msg.from].pc.setRemoteDescription(new RTCSessionDescription(msg.desc))
+        }
+        break
+      case 'candidate':
+        const peer = peers.value[msg.from]
+        if (peer) {
+          if (peer.pc.remoteDescription) {
+            await peer.pc.addIceCandidate(msg.candidate)
+          } else {
+            peer.pendingCandidates.push(msg.candidate)
+          }
+        }
+        break
     }
   }
 })
 
 async function sendFile() {
   if (!file.value) return
+
   for (const userId of onlineUsers.value) {
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
     const dc = pc.createDataChannel('file')
+    const pendingCandidates = []
+
+    peers.value[userId] = { pc, dc, pendingCandidates }
+
     setupReceiverDataChannel(dc)
 
     pc.onicecandidate = ({ candidate }) => {
@@ -44,22 +64,25 @@ async function sendFile() {
 
     const offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
-    ws.value.send(JSON.stringify({ type: 'offer', to: userId, desc: offer }))
-    peers.value[userId] = { pc, dc }
 
-    // 控制发送速率：最大吞吐策略
+    ws.value.send(JSON.stringify({
+      type: 'offer',
+      to: userId,
+      desc: pc.localDescription // 传的是对象，不用手动 stringify
+    }))
+
     const reader = file.value.stream().getReader()
-    const MAX_BUFFER = 16 * 1024 * 1024 // 16MB
+    const MAX_BUFFER = 16 * 1024 * 1024
 
     async function sendChunks() {
       let { value, done } = await reader.read()
       while (!done) {
         if (dc.bufferedAmount > MAX_BUFFER) {
           await new Promise(res => setTimeout(res, 10))
-          continue
+        } else {
+          dc.send(value)
+          ;({ value, done } = await reader.read())
         }
-        dc.send(value)
-        ;({ value, done } = await reader.read())
       }
       dc.send('EOF')
     }
@@ -70,9 +93,12 @@ async function sendFile() {
 
 async function handleOffer(msg) {
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
-  peers.value[msg.from] = { pc }
+  const pendingCandidates = []
+  peers.value[msg.from] = { pc, pendingCandidates }
 
-  pc.ondatachannel = (e) => setupReceiverDataChannel(e.channel)
+  pc.ondatachannel = (e) => {
+    setupReceiverDataChannel(e.channel)
+  }
 
   pc.onicecandidate = ({ candidate }) => {
     if (candidate) {
@@ -80,10 +106,21 @@ async function handleOffer(msg) {
     }
   }
 
-  await pc.setRemoteDescription(msg.desc)
+  await pc.setRemoteDescription(new RTCSessionDescription(msg.desc))
+
+  // 处理早到的 candidates
+  for (const c of pendingCandidates) {
+    await pc.addIceCandidate(c)
+  }
+
   const answer = await pc.createAnswer()
   await pc.setLocalDescription(answer)
-  ws.value.send(JSON.stringify({ type: 'answer', to: msg.from, desc: answer }))
+
+  ws.value.send(JSON.stringify({
+    type: 'answer',
+    to: msg.from,
+    desc: pc.localDescription
+  }))
 }
 
 function setupReceiverDataChannel(dc) {
