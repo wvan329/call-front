@@ -318,7 +318,7 @@ const handleSignalingMessage = async (msg) => {
     switch (type) {
       case 'offer':
         await handleOffer(msg.sdp, from);
-        break;
+        break; 
       case 'answer':
         await handleAnswer(msg.sdp, from);
         break;
