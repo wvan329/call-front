@@ -20,7 +20,7 @@
       </button>
       <div v-if="selectedFile" class="file-info">
         <p>已选文件: {{ selectedFile.name }} ({{ formatBytes(selectedFile.size) }})</p>
-        <p>分块大小: {{ formatBytes(CHUNK_SIZE) }}</p>
+        <p>分块大小: {{ formatBytes(currentChunkSize) }}</p>
       </div>
       <div class="progress-container" v-if="selectedFile">
         <div class="progress-bar" :style="{ width: sendProgress + '%' }"></div>
@@ -51,17 +51,21 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'; // Added nextTick
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
 
 // --- Configuration Constants ---
 const WS_URL = 'ws://59.110.35.198/wgk/ws/file';
 const ICE_SERVERS = [{ urls: 'stun:59.110.35.198:3478' }];
-const CHUNK_SIZE = 64 * 1024; // Smaller chunks (e.g., 64KB-256KB) can be more responsive to congestion
-const MAX_BUFFERED_AMOUNT = 10 * 1024 * 1024; // Increased to 16MB. This is crucial for speed.
-const RETRANSMIT_TIMEOUT = 2000; // 2 seconds for retransmission timeout (increased)
-const MAX_RETRANSMITS = 100; // Max retries for a chunk (increased)
-const HEARTBEAT_INTERVAL = 25000;
-const UI_UPDATE_INTERVAL = 100; // Update UI every 100ms
+const INITIAL_CHUNK_SIZE = 64 * 1024; // 初始分块大小 64KB
+const MAX_CHUNK_SIZE = 256 * 1024;    // 最大分块大小 256KB
+const MIN_CHUNK_SIZE = 32 * 1024;     // 最小分块大小 32KB
+const MAX_BUFFERED_AMOUNT = 5 * 1024 * 1024; // 5MB 缓冲区
+const RETRANSMIT_TIMEOUT = 2500;      // 2.5秒重传超时
+const MAX_RETRANSMITS = 20;           // 最大重传次数
+const HEARTBEAT_INTERVAL = 25000;     // 25秒心跳间隔
+const UI_UPDATE_INTERVAL = 100;       // 100ms UI更新间隔
+const HIGH_SPEED_THRESHOLD = 10 * 1024 * 1024; // 10MB/s 高速阈值
+const LOW_SPEED_THRESHOLD = 1 * 1024 * 1024;   // 1MB/s 低速阈值
 
 // --- Reactive State ---
 const ws = ref(null);
@@ -69,26 +73,24 @@ const mySessionId = ref('');
 const selectedFile = ref(null);
 const errorMessage = ref('');
 const isTransferring = ref(false);
+const currentChunkSize = ref(INITIAL_CHUNK_SIZE); // 可动态调整的分块大小
 
-// Map to store RTCPeerConnection instances, keyed by peerId
+// RTCPeerConnection 管理
 const peerConnections = reactive({});
 
-// Stores ongoing outgoing file transfers
-// { fileId: { file, totalChunks, sentChunks, ackedChunks, pendingAcks, peers: { peerId: { reader, readerBusy, readerQueue: [], isPeerComplete, ... } }, isComplete, resolve, reject } }
+// 外发传输管理
 const outgoingTransfers = reactive({});
 
-// Stores incoming file data and metadata
-const incomingFiles = reactive({}); // { fileId: { name, size, type, chunks: {}, receivedSize, progress, url } }
+// 接收文件管理
+const incomingFiles = reactive({});
 
-// UI related reactive states for transfer progress and speed
+// UI相关状态
 const totalBytesSent = ref(0);
 const lastSpeedCalcTime = ref(0);
 const lastBytesSentForSpeed = ref(0);
-const currentSendSpeed = ref(0); // bytes/s
-const sendProgress = ref(0); // Overall send progress
-
-// List of received files for UI display
-const receivedFiles = reactive([]); // [{ id, name, size, progress, url }]
+const currentSendSpeed = ref(0);
+const sendProgress = ref(0);
+const receivedFiles = reactive([]);
 
 // --- Computed Properties ---
 const wsStatus = computed(() => {
@@ -101,18 +103,16 @@ const wsStatus = computed(() => {
     default: return { class: 'disconnected', text: '未知' };
   }
 });
+
 const sendMetaData = (dc, fileId, name, size, type) => {
   const metadata = {
     type: 'file-metadata',
-    fileId: fileId,
-    name: name,
-    size: size,
-    fileType: type,
-    chunkSize: CHUNK_SIZE
+    fileId, name, size, type,
+    chunkSize: currentChunkSize.value // 发送当前分块大小
   };
   try {
     dc.send(JSON.stringify(metadata));
-    console.log(`Sent metadata for file ${fileId} (${name}) to peer via DataChannel.`);
+    console.log(`Sent metadata for file ${fileId} (${name}) to peer.`);
   } catch (e) {
     console.error('Error sending metadata:', e);
   }
@@ -126,10 +126,10 @@ const handleFileSelection = (event) => {
   totalBytesSent.value = 0;
   currentSendSpeed.value = 0;
   isTransferring.value = false;
-  // Clear any existing transfers if a new file is selected
-  for(const fileId in outgoingTransfers) {
+  // 清理现有传输
+  for (const fileId in outgoingTransfers) {
     const transfer = outgoingTransfers[fileId];
-    if(!transfer.isComplete && transfer.reject) {
+    if (!transfer.isComplete && transfer.reject) {
       transfer.reject(new Error('New file selected, transfer cancelled.'));
     }
     delete outgoingTransfers[fileId];
@@ -141,7 +141,9 @@ const startFileTransfer = async () => {
     errorMessage.value = '请先选择文件！';
     return;
   }
-  const activePeers = Object.keys(peerConnections).filter(id => peerConnections[id].status === 'connected' && peerConnections[id].dataChannel?.readyState === 'open');
+  const activePeers = Object.keys(peerConnections).filter(id => 
+    peerConnections[id].status === 'connected' && peerConnections[id].dataChannel?.readyState === 'open'
+  );
 
   if (activePeers.length === 0) {
     errorMessage.value = '没有可用的对等连接！';
@@ -156,17 +158,15 @@ const startFileTransfer = async () => {
   lastBytesSentForSpeed.value = 0;
   currentSendSpeed.value = 0;
   sendProgress.value = 0;
+  currentChunkSize.value = INITIAL_CHUNK_SIZE; // 重置分块大小
   startUiUpdateTimer();
 
   const file = selectedFile.value;
   const fileId = generateUniqueId();
-  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+  const totalChunks = Math.ceil(file.size / currentChunkSize.value);
 
-  // Initialize outgoing transfer state
   outgoingTransfers[fileId] = {
-    file,
-    fileId,
-    totalChunks,
+    file, fileId, totalChunks,
     sentChunks: new Set(),
     ackedChunks: new Set(),
     pendingAcks: new Map(),
@@ -177,16 +177,12 @@ const startFileTransfer = async () => {
     reject: null
   };
 
-  // ****** 关键改动：将创建的 transfer 对象赋值给一个局部变量 `currentTransfer` ******
-  // 这样 `currentTransfer` 就能被下面的闭包正确捕获
   const currentTransfer = outgoingTransfers[fileId];
-
   const transferPromise = new Promise((resolve, reject) => {
     currentTransfer.resolve = resolve;
     currentTransfer.reject = reject;
   });
 
-  // Prepare transfer for each connected peer
   activePeers.forEach(peerId => {
     const peerTransfer = {
       reader: new FileReader(),
@@ -195,38 +191,32 @@ const startFileTransfer = async () => {
       isPeerComplete: false,
       lastAckTime: Date.now()
     };
-    currentTransfer.peers[peerId] = peerTransfer; // 使用 currentTransfer
+    currentTransfer.peers[peerId] = peerTransfer;
 
-    // Set up FileReader handlers once
     peerTransfer.reader.onload = (e) => {
       peerTransfer.readerBusy = false;
-      const { chunkIndex, originalSliceSize } = peerTransfer.readerQueue.shift();
+      const { chunkIndex } = peerTransfer.readerQueue.shift();
       const chunkDataArrayBuffer = e.target.result;
 
-      // ****** 在这里使用 `currentTransfer.fileId` ******
       const fullPacket = createDataPacket(currentTransfer.fileId, chunkIndex, chunkDataArrayBuffer);
-
       const dc = peerConnections[peerId]?.dataChannel;
       if (dc?.readyState === 'open' && dc.bufferedAmount < MAX_BUFFERED_AMOUNT) {
         try {
           dc.send(fullPacket);
-
-          currentTransfer.sentChunks.add(chunkIndex); // 使用 currentTransfer
-          currentTransfer.pendingAcks.set(chunkIndex, { // 使用 currentTransfer
+          currentTransfer.sentChunks.add(chunkIndex);
+          currentTransfer.pendingAcks.set(chunkIndex, {
             timestamp: Date.now(),
             retries: 0,
             data: fullPacket
           });
-          totalBytesSent.value += originalSliceSize;
-
+          totalBytesSent.value += chunkDataArrayBuffer.byteLength;
         } catch (sendError) {
           console.error(`Error sending chunk ${chunkIndex} to ${peerId}:`, sendError);
           closePeerConnection(peerId);
         }
       } else {
-        console.warn(`DataChannel not ready or buffer full for ${peerId} after reading chunk ${chunkIndex}. This chunk might be delayed.`);
+        console.warn(`DataChannel not ready or buffer full for ${peerId}.`);
       }
-      // ****** 在这里使用 `currentTransfer.fileId` ******
       processOutgoingQueue(currentTransfer.fileId, peerId);
     };
 
@@ -235,18 +225,16 @@ const startFileTransfer = async () => {
       console.error(`FileReader error for ${peerId}:`, e.target.error);
       peerTransfer.isPeerComplete = true;
       errorMessage.value = `文件读取失败: ${e.target.error.message}`;
-      if (currentTransfer.reject) currentTransfer.reject(e.target.error); // 使用 currentTransfer
-      currentTransfer.isComplete = true; // 使用 currentTransfer
+      if (currentTransfer.reject) currentTransfer.reject(e.target.error);
+      currentTransfer.isComplete = true;
     };
 
-    // Send initial metadata
     const dc = peerConnections[peerId]?.dataChannel;
     if (dc?.readyState === 'open') {
       sendMetaData(dc, fileId, file.name, file.size, file.type || 'application/octet-stream');
-      // ****** 在这里使用 `currentTransfer.fileId` ******
-      processOutgoingQueue(currentTransfer.fileId, peerId);
+      processOutgoingQueue(fileId, peerId);
     } else {
-      console.log(`DC not open for ${peerId}, metadata and chunks will be sent when DC opens.`);
+      console.log(`DataChannel for ${peerId} not open yet.`);
     }
   });
 
@@ -269,7 +257,6 @@ const activePeersCount = computed(() => {
     pc.status === 'connected' && pc.dataChannel?.readyState === 'open'
   ).length;
 });
-
 
 // --- Utility Functions ---
 const formatBytes = (bytes, decimals = 2) => {
@@ -300,7 +287,7 @@ const sendWsMessage = (type, data = {}, to = null) => {
 
 let heartbeatIntervalId;
 const startHeartbeat = () => {
-  stopHeartbeat(); // Clear any existing heartbeat
+  stopHeartbeat();
   heartbeatIntervalId = setInterval(() => {
     if (ws.value?.readyState === WebSocket.OPEN) {
       sendWsMessage('ping');
@@ -339,11 +326,11 @@ const connectWebSocket = () => {
   ws.value.onopen = () => {
     console.log('WebSocket connection established.');
     startHeartbeat();
-    sendWsMessage('get-users'); // Request user list on connect
+    sendWsMessage('get-users');
   };
 
   ws.value.onmessage = async (event) => {
-    if (event.data === 'pong') return; // Heartbeat response
+    if (event.data === 'pong') return;
 
     try {
       const msg = JSON.parse(event.data);
@@ -370,23 +357,23 @@ const connectWebSocket = () => {
           closePeerConnection(msg.from);
           break;
         default:
-          console.warn('Unknown WebSocket message type:', msg.type, msg);
+          console.warn('Unknown WebSocket message type:', msg.type);
       }
     } catch (error) {
-      console.error('Error parsing or handling WebSocket message:', error, event.data);
+      console.error('Error handling WebSocket message:', error);
     }
   };
 
   ws.value.onclose = () => {
     console.log('WebSocket connection closed. Reconnecting...');
     stopHeartbeat();
-    Object.keys(peerConnections).forEach(closePeerConnection); // Clear all peer connections
-    setTimeout(connectWebSocket, 5000); // Attempt to reconnect after 5 seconds
+    Object.keys(peerConnections).forEach(closePeerConnection);
+    setTimeout(connectWebSocket, 5000);
   };
 
   ws.value.onerror = (error) => {
     console.error('WebSocket error:', error);
-    ws.value?.close(); // Force close to trigger onclose and reconnect
+    ws.value?.close();
   };
 };
 
@@ -394,18 +381,15 @@ const handleUserList = (users) => {
   const onlinePeers = new Set(users.filter(id => id !== mySessionId.value));
   const currentPeers = new Set(Object.keys(peerConnections));
 
-  // Add new peers: If we are the "smaller" ID, we initiate the offer
   onlinePeers.forEach(peerId => {
     if (!currentPeers.has(peerId)) {
-      // Always create PC for new peers, regardless of who offers
       createPeerConnection(peerId);
-      if (mySessionId.value < peerId) { // This peer initiates the offer
+      if (mySessionId.value < peerId) {
         createOffer(peerId);
       }
     }
   });
 
-  // Remove disconnected peers
   currentPeers.forEach(peerId => {
     if (!onlinePeers.has(peerId)) {
       closePeerConnection(peerId);
@@ -423,23 +407,19 @@ const createPeerConnection = (peerId) => {
   console.log(`Creating RTCPeerConnection for peer: ${peerId}`);
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-  // Store PC and data channel reference
   peerConnections[peerId] = {
     pc,
     dataChannel: null,
-    status: 'connecting', // 'connecting', 'connected', 'disconnected'
-    // For file sending, we manage per-peer state within outgoingTransfers
+    status: 'connecting'
   };
 
-  // Setup Data Channel for sending (created by the offerer)
   const dataChannel = pc.createDataChannel('file-transfer-channel', {
-    ordered: true, // Guarantees order
-    maxRetransmits: 0 // Rely on application-level ACKs for reliability
+    ordered: true,
+    maxRetransmits: 0
   });
   peerConnections[peerId].dataChannel = dataChannel;
   setupDataChannel(dataChannel, peerId);
 
-  // Event handlers for the PeerConnection
   pc.onicecandidate = (event) => {
     if (event.candidate) {
       sendWsMessage('candidate', { candidate: event.candidate }, peerId);
@@ -448,18 +428,15 @@ const createPeerConnection = (peerId) => {
 
   pc.onconnectionstatechange = () => {
     console.log(`PeerConnection state with ${peerId}: ${pc.connectionState}`);
-    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected' || pc.connectionState === 'closed') {
+    if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
       closePeerConnection(peerId);
     } else if (pc.connectionState === 'connected') {
       peerConnections[peerId].status = 'connected';
-      console.log(`Peer ${peerId} connected!`);
-      // No need to process queue here, dc.onopen will handle it
     }
   };
 
-  // Handle incoming Data Channel setup (for answerer)
   pc.ondatachannel = (event) => {
-    console.log(`Incoming DataChannel from ${peerId}: ${event.channel.label}`);
+    console.log(`Incoming DataChannel from ${peerId}`);
     const incomingDc = event.channel;
     peerConnections[peerId].dataChannel = incomingDc;
     setupDataChannel(incomingDc, peerId);
@@ -474,17 +451,13 @@ const closePeerConnection = (peerId) => {
   console.log(`Closing PeerConnection with ${peerId}`);
   const { pc, dataChannel } = peerConnections[peerId];
 
-  // Abort any ongoing file reads for this peer
   for (const fileId in outgoingTransfers) {
     const transfer = outgoingTransfers[fileId];
     if (transfer.peers[peerId]) {
-      // Mark this peer as disconnected for the transfer
-      transfer.peers[peerId].isPeerComplete = true; // No more sending to this peer
-      // Abort any pending FileReader operations for this specific peer
+      transfer.peers[peerId].isPeerComplete = true;
       if (transfer.peers[peerId].readerBusy) {
         transfer.peers[peerId].reader.abort();
       }
-      // Clean up its queue
       transfer.peers[peerId].readerQueue.length = 0;
     }
   }
@@ -506,15 +479,13 @@ const closePeerConnection = (peerId) => {
 
   delete peerConnections[peerId];
 
-  // After closing, check if any broadcast transfer has no more active peers
   for (const fileId in outgoingTransfers) {
     const transfer = outgoingTransfers[fileId];
-    const activePeersForTransfer = Object.keys(transfer.peers).filter(pId =>
+    const activePeers = Object.keys(transfer.peers).filter(pId =>
       peerConnections[pId] && peerConnections[pId].status === 'connected' && !transfer.peers[pId].isPeerComplete
     );
-    if (activePeersForTransfer.length === 0 && !transfer.isComplete) {
-      // If no more active peers and transfer not marked complete, assume failure/stop
-      transfer.reject(new Error(`All connected peers for transfer ${fileId} disconnected.`));
+    if (activePeers.length === 0 && !transfer.isComplete) {
+      transfer.reject(new Error(`All peers disconnected for transfer ${fileId}`));
       transfer.isComplete = true;
     }
   }
@@ -525,7 +496,6 @@ const setupDataChannel = (dc, peerId) => {
     console.log(`DataChannel to ${peerId} opened!`);
     if (peerConnections[peerId]) {
       peerConnections[peerId].status = 'connected';
-      // Process outgoing queue for ALL active transfers to this newly opened DC
       for (const fileId in outgoingTransfers) {
         processOutgoingQueue(fileId, peerId);
       }
@@ -534,23 +504,15 @@ const setupDataChannel = (dc, peerId) => {
 
   dc.onclose = () => {
     console.log(`DataChannel to ${peerId} closed.`);
-    // The closePeerConnection handles broader cleanup
-    // peerConnections[peerId].dataChannel = null; // Mark as null directly
+    closePeerConnection(peerId);
   };
 
-dc.onerror = (error) => { 
+  dc.onerror = (error) => {
     console.error(`DataChannel error with ${peerId}:`, error);
-    // 尝试打印更详细的错误对象，看看它是否包含 `code` 或 `message`
-    console.error("DataChannel error object details:", JSON.stringify(error));
-    if (error.error) {
-        console.error("Specific RTCError:", error.error.name, error.error.message, error.error.code);
-    }
     closePeerConnection(peerId);
-};
+  };
 
   dc.onbufferedamountlow = () => {
-    // console.log(`DataChannel buffered amount low for ${peerId}`);
-    // When buffer drains, try to send more for all active transfers
     for (const fileId in outgoingTransfers) {
       processOutgoingQueue(fileId, peerId);
     }
@@ -577,7 +539,7 @@ const createOffer = async (peerId) => {
 };
 
 const handleSignalingOffer = async (sdp, peerId) => {
-  const pc = createPeerConnection(peerId); // Ensures PC exists for the answerer
+  const pc = createPeerConnection(peerId);
   try {
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
     const answer = await pc.createAnswer();
@@ -611,34 +573,31 @@ const handleSignalingCandidate = async (candidate, peerId) => {
     return;
   }
   try {
-    // Add a small delay for addIceCandidate if it's too fast, though typically not needed
     await pc.addIceCandidate(new RTCIceCandidate(candidate));
-    // console.log(`Added ICE candidate from ${peerId}`);
   } catch (error) {
     if (!error.message.includes('already added') && !error.message.includes('closed')) {
       console.error(`Failed to add ICE candidate from ${peerId}:`, error);
     }
   }
 };
+
 const createDataPacket = (fileId, chunkIndex, chunkData) => {
-  // Packet format: [fileId_length (1 byte)] + [fileId (variable)] + [chunkIndex (4 bytes)] + [chunkData]
   const fileIdBytes = new TextEncoder().encode(fileId);
   const header = new Uint8Array(1 + fileIdBytes.length + 4);
 
   let offset = 0;
-  header[offset++] = fileIdBytes.length; // Length of fileId
-  header.set(fileIdBytes, offset); // FileId bytes
+  header[offset++] = fileIdBytes.length;
+  header.set(fileIdBytes, offset);
   offset += fileIdBytes.length;
 
-  new DataView(header.buffer).setUint32(offset, chunkIndex, true); // Chunk index (little-endian)
+  new DataView(header.buffer).setUint32(offset, chunkIndex, true);
 
-  if (chunkData) { // If chunkData is provided (for retransmission)
+  if (chunkData) {
     const packet = new Uint8Array(header.length + chunkData.byteLength);
     packet.set(header, 0);
-    packet.set(new Uint8Array(chunkData), header.length); // Actual chunk data
+    packet.set(new Uint8Array(chunkData), header.length);
     return packet.buffer;
   }
-  // Return header only initially, actual chunk data added by FileReader
   return header.buffer;
 };
 
@@ -665,7 +624,6 @@ const checkOverallTransferCompletion = (fileId) => {
   }
 };
 
-
 // Retransmission timer
 let retransmissionTimer = null;
 const startRetransmissionTimer = () => {
@@ -676,49 +634,39 @@ const startRetransmissionTimer = () => {
       if (transfer.isComplete) continue;
 
       transfer.pendingAcks.forEach((item, chunkIndex) => {
-        // Only retransmit if no ACK received AND the chunk is not currently being read by a FileReader for any peer.
-        // This prevents conflicting reads.
         const isBeingReadByAnyPeer = Object.values(transfer.peers).some(peerTransfer =>
           peerTransfer.readerBusy && peerTransfer.readerQueue[0]?.chunkIndex === chunkIndex
         );
 
         if (Date.now() - item.timestamp > RETRANSMIT_TIMEOUT && !isBeingReadByAnyPeer) {
           if (item.retries < MAX_RETRANSMITS) {
-            // console.warn(`Retransmitting chunk ${chunkIndex} for ${fileId} (retry ${item.retries + 1})`);
-            // Find an open data channel to send it
             for (const peerId in transfer.peers) {
               const peer = peerConnections[peerId];
               const dc = peer?.dataChannel;
               if (dc?.readyState === 'open' && !transfer.peers[peerId].isPeerComplete) {
                 if (dc.bufferedAmount < MAX_BUFFERED_AMOUNT) {
                   try {
-                    dc.send(item.data); // Resend the original packet with data
-                    item.timestamp = Date.now(); // Reset timestamp
+                    dc.send(item.data);
+                    item.timestamp = Date.now();
                     item.retries++;
-                    return; // Only retransmit once per timeout, then check next chunk
+                    return;
                   } catch (e) {
                     console.error(`Error retransmitting chunk ${chunkIndex} to ${peerId}:`, e);
-                    // If send fails, potentially mark peer as problematic
                   }
                 }
               }
             }
           } else {
-            console.error(`Max retransmits reached for chunk ${chunkIndex} of ${fileId}. Transfer failed for this chunk.`);
-            transfer.pendingAcks.delete(chunkIndex); // Remove from pending
-            // This chunk will now be permanently missing for the receiver if not acked.
-            // If this is a critical file, you might want to reject the whole transfer:
-            // if (transfer.reject) transfer.reject(new Error(`Max retransmits for chunk ${chunkIndex} reached.`));
-            // transfer.isComplete = true; // Stop further processing for this file
+            console.error(`Max retransmits reached for chunk ${chunkIndex} of ${fileId}.`);
+            transfer.pendingAcks.delete(chunkIndex);
           }
         }
       });
     }
-    // If no active transfers, stop the timer
-    if (Object.keys(outgoingTransfers).length === 0 && !isTransferring.value) { // Also check isTransferring flag
+    if (Object.keys(outgoingTransfers).length === 0 && !isTransferring.value) {
       stopRetransmissionTimer();
     }
-  }, 500); // Check every 500ms
+  }, 500);
 };
 
 const stopRetransmissionTimer = () => {
@@ -730,42 +678,51 @@ const stopRetransmissionTimer = () => {
 
 const updateSendProgress = () => {
   const now = Date.now();
-  // Speed calculation
   const timeDiffSeconds = (now - lastSpeedCalcTime.value) / 1000;
-  if (timeDiffSeconds >= (UI_UPDATE_INTERVAL / 1000)) { // Update speed based on UI_UPDATE_INTERVAL
+
+  if (timeDiffSeconds >= (UI_UPDATE_INTERVAL / 1000)) {
     const bytesDiff = totalBytesSent.value - lastBytesSentForSpeed.value;
     currentSendSpeed.value = bytesDiff / timeDiffSeconds;
     lastBytesSentForSpeed.value = totalBytesSent.value;
     lastSpeedCalcTime.value = now;
   }
 
-  // Progress calculation
   if (selectedFile.value && selectedFile.value.size > 0 && Object.keys(outgoingTransfers).length > 0) {
-    let completedChunksCount = 0;
-    let totalExpectedChunks = 0;
-
-    // For the currently active transfer (assuming only one broadcast at a time)
-    // Find the primary transfer associated with selectedFile
     const currentFileTransfer = Object.values(outgoingTransfers).find(t => t.file.name === selectedFile.value.name);
-
-    if (currentFileTransfer) {
-      completedChunksCount = currentFileTransfer.ackedChunks.size;
-      totalExpectedChunks = currentFileTransfer.totalChunks;
-
-      if (totalExpectedChunks > 0) {
-        sendProgress.value = (completedChunksCount / totalExpectedChunks) * 100;
-        if (sendProgress.value > 100) sendProgress.value = 100;
-      } else {
-        sendProgress.value = 0;
-      }
+    if (currentFileTransfer && currentFileTransfer.totalChunks > 0) {
+      sendProgress.value = (currentFileTransfer.ackedChunks.size / currentFileTransfer.totalChunks) * 100;
     } else {
-      sendProgress.value = 0; // No active transfer for the selected file
+      sendProgress.value = 0;
     }
   } else {
-    sendProgress.value = 0; // No file selected or no active transfers
+    sendProgress.value = 0;
   }
+
+  // --- 关键新增：动态调整分块大小 ---
+  adjustChunkSizeBasedOnSpeed();
 };
 
+// --- 新增：动态调整分块大小 ---
+const adjustChunkSizeBasedOnSpeed = () => {
+  if (isTransferring.value && selectedFile.value) {
+    // 如果速度超过高速阈值，尝试减小分块大小
+    if (currentSendSpeed.value > HIGH_SPEED_THRESHOLD && currentChunkSize.value > MIN_CHUNK_SIZE) {
+      currentChunkSize.value = Math.max(
+        MIN_CHUNK_SIZE,
+        Math.floor(currentChunkSize.value / 2)
+      );
+      console.log(`Speed too high (${formatSpeed(currentSendSpeed.value)}), reducing chunk size to ${formatBytes(currentChunkSize.value)}`);
+    }
+    // 如果速度低于低速阈值，尝试增大分块大小
+    else if (currentSendSpeed.value < LOW_SPEED_THRESHOLD && currentChunkSize.value < MAX_CHUNK_SIZE) {
+      currentChunkSize.value = Math.min(
+        MAX_CHUNK_SIZE,
+        currentChunkSize.value * 2
+      );
+      console.log(`Speed too low (${formatSpeed(currentSendSpeed.value)}), increasing chunk size to ${formatBytes(currentChunkSize.value)}`);
+    }
+  }
+};
 
 // --- File Receiving Logic ---
 const handleReceivedData = (data, peerId) => {
@@ -775,7 +732,7 @@ const handleReceivedData = (data, peerId) => {
       if (msg.type === 'file-metadata') {
         initiateIncomingFile(msg, peerId);
       } else if (msg.type === 'file-transfer-complete') {
-        finalizeIncomingFile(msg.fileId, peerId); // Finalize, or mark as complete if not fully received
+        finalizeIncomingFile(msg.fileId, peerId);
       } else if (msg.type === 'chunk-ack') {
         handleChunkAck(msg.fileId, msg.chunkIndex, peerId);
       }
@@ -788,37 +745,31 @@ const handleReceivedData = (data, peerId) => {
 };
 
 const initiateIncomingFile = (metadata, peerId) => {
-  const { fileId, name, size, fileType, chunkSize } = metadata;
+  const { fileId, name, size, type, chunkSize } = metadata;
   if (incomingFiles[fileId]) {
-    console.warn(`Metadata for ${fileId} already received from ${peerId}.`);
-    return; // Already initialized, possibly redundant metadata
+    console.warn(`Metadata for ${fileId} already received.`);
+    return;
   }
-
-  console.log(`Initiating incoming file: ${name} (${formatBytes(size)}) from ${peerId}`);
-  const totalChunks = Math.ceil(size / chunkSize);
 
   const newIncomingFile = reactive({
     id: fileId,
     name,
     size,
-    type: fileType,
+    type,
     chunkSize,
-    totalChunks,
-    receivedChunks: new Map(), // { chunkIndex: ArrayBuffer }
+    totalChunks: Math.ceil(size / chunkSize),
+    receivedChunks: new Map(),
     receivedSize: 0,
     progress: 0,
-    url: null,
-    peerSource: peerId // Keep track of which peer sent this file initially
+    url: null
   });
   incomingFiles[fileId] = newIncomingFile;
 
-  // Add to UI list if not already there (multiple peers might send same file)
   const existingUiFile = receivedFiles.find(f => f.id === fileId);
   if (!existingUiFile) {
     receivedFiles.push(newIncomingFile);
   }
 };
-
 
 const sendChunkAck = (fileId, chunkIndex, peerId) => {
   const ackMsg = {
@@ -830,28 +781,123 @@ const sendChunkAck = (fileId, chunkIndex, peerId) => {
   if (dc?.readyState === 'open') {
     try {
       dc.send(JSON.stringify(ackMsg));
-      // console.log(`Sent ACK for chunk ${chunkIndex} of ${fileId} to ${peerId}`);
     } catch (e) {
-      // console.error(`Error sending ACK for chunk ${chunkIndex} to ${peerId}:`, e);
-      // If ACK fails, the sender will retransmit.
+      console.error(`Error sending ACK for chunk ${chunkIndex} to ${peerId}:`, e);
     }
   }
 };
 
 const handleChunkAck = (fileId, chunkIndex, peerId) => {
   const transfer = outgoingTransfers[fileId];
-  if (transfer) {
-    if (!transfer.ackedChunks.has(chunkIndex)) { // Only if this is a new ACK
-      transfer.ackedChunks.add(chunkIndex);
-      transfer.pendingAcks.delete(chunkIndex); // Remove from pending Acks
-      // console.log(`ACK received for chunk ${chunkIndex} of ${fileId} from ${peerId}`);
-      // Immediately try to send more if ACK frees up a slot
-      processOutgoingQueue(fileId, peerId);
-    }
+  if (transfer && !transfer.ackedChunks.has(chunkIndex)) {
+    transfer.ackedChunks.add(chunkIndex);
+    transfer.pendingAcks.delete(chunkIndex);
+    processOutgoingQueue(fileId, peerId);
   }
 };
 
+const processOutgoingQueue = (fileId, peerId) => {
+  const transfer = outgoingTransfers[fileId];
+  if (!transfer || transfer.isComplete) return;
 
+  const peerTransfer = transfer.peers[peerId];
+  if (!peerTransfer || peerTransfer.isPeerComplete) return;
+
+  const dc = peerConnections[peerId]?.dataChannel;
+  if (!dc || dc.readyState !== 'open') return;
+
+  if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) return;
+
+  if (!peerTransfer.readerBusy && peerTransfer.readerQueue.length === 0) {
+    let nextChunkIndex = -1;
+    for (let i = 0; i < transfer.totalChunks; i++) {
+      if (!transfer.ackedChunks.has(i) && !transfer.pendingAcks.has(i)) {
+        nextChunkIndex = i;
+        break;
+      }
+    }
+
+    if (nextChunkIndex !== -1) {
+      const start = nextChunkIndex * currentChunkSize.value;
+      const end = Math.min(start + currentChunkSize.value, transfer.file.size);
+      const slice = transfer.file.slice(start, end);
+      peerTransfer.readerQueue.push({ chunkIndex: nextChunkIndex });
+      peerTransfer.readerBusy = true;
+      peerTransfer.reader.readAsArrayBuffer(slice);
+      return;
+    }
+  }
+
+  if (transfer.ackedChunks.size === transfer.totalChunks && !peerTransfer.isPeerComplete) {
+    sendCompletionMessage(dc, fileId);
+    peerTransfer.isPeerComplete = true;
+    checkOverallTransferCompletion(fileId);
+  }
+};
+
+const processIncomingChunk = (chunkData, peerId) => {
+  const view = new DataView(chunkData);
+  let offset = 0;
+
+  const fileIdLen = view.getUint8(offset++);
+  const fileIdBytes = new Uint8Array(chunkData, offset, fileIdLen);
+  const fileId = new TextDecoder().decode(fileIdBytes);
+  offset += fileIdLen;
+
+  const chunkIndex = view.getUint32(offset, true);
+  offset += 4;
+
+  const chunkPayload = chunkData.slice(offset);
+
+  const file = incomingFiles[fileId];
+  if (!file) {
+    console.warn(`Received chunk for unknown fileId: ${fileId}`);
+    return;
+  }
+
+  if (file.receivedChunks.has(chunkIndex)) {
+    sendChunkAck(fileId, chunkIndex, peerId);
+    return;
+  }
+
+  file.receivedChunks.set(chunkIndex, chunkPayload);
+  file.receivedSize += chunkPayload.byteLength;
+  file.progress = (file.receivedSize / file.size) * 100;
+
+  sendChunkAck(fileId, chunkIndex, peerId);
+
+  if (file.receivedChunks.size === file.totalChunks && file.receivedSize >= file.size) {
+    finalizeIncomingFile(fileId, peerId);
+  }
+};
+
+const finalizeIncomingFile = (fileId, peerId) => {
+  const file = incomingFiles[fileId];
+  if (!file || file.url) return;
+
+  const expectedTotalBytes = file.size;
+  const actualReceivedBytes = Array.from(file.receivedChunks.values()).reduce((sum, chunk) => sum + chunk.byteLength, 0);
+
+  if (file.receivedChunks.size !== file.totalChunks || actualReceivedBytes < expectedTotalBytes) {
+    console.warn(`Finalizing file with incomplete data: chunks ${file.receivedChunks.size}/${file.totalChunks}, bytes ${actualReceivedBytes}/${expectedTotalBytes}`);
+    return;
+  }
+
+  const sortedChunks = [];
+  for (let i = 0; i < file.totalChunks; i++) {
+    const chunk = file.receivedChunks.get(i);
+    if (!chunk) {
+      console.error(`Missing chunk ${i} for file ${file.name}`);
+      return;
+    }
+    sortedChunks.push(chunk);
+  }
+
+  const blob = new Blob(sortedChunks, { type: file.type });
+  file.url = URL.createObjectURL(blob);
+  file.progress = 100;
+  console.log(`File ${file.name} received and finalized.`);
+};
 
 // --- Lifecycle Hooks ---
 onMounted(() => {
@@ -865,172 +911,12 @@ onUnmounted(() => {
   stopUiUpdateTimer();
   if (ws.value) ws.value.close();
   Object.keys(peerConnections).forEach(closePeerConnection);
-  // Revoke any created object URLs to free up memory
   receivedFiles.forEach(file => {
     if (file.url) URL.revokeObjectURL(file.url);
   });
 });
-
-
-
-
-
-
-// Process the outgoing queue for a specific file and peer
-const processOutgoingQueue = (fileId, peerId) => {
-  const transfer = outgoingTransfers[fileId];
-  if (!transfer || transfer.isComplete) return;
-
-  const peerTransfer = transfer.peers[peerId];
-  if (!peerTransfer || peerTransfer.isPeerComplete) return;
-
-  const peerConn = peerConnections[peerId];
-  const dc = peerConn?.dataChannel;
-
-  if (!dc || dc.readyState !== 'open') {
-    // console.log(`DataChannel to ${peerId} not open, cannot send.`);
-    return;
-  }
-
-  // --- 1. Check for space in DataChannel buffer ---
-  // 只有当缓冲区有空间且 FileReader 不忙时才继续
-  if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-    // console.log(`Buffered amount for ${peerId} is high: ${formatBytes(dc.bufferedAmount)}`);
-    return; // 等待 onbufferedamountlow 事件
-  }
-
-  // --- 2. 尝试喂给 FileReader 队列（如果它不忙） ---
-  if (!peerTransfer.readerBusy && peerTransfer.readerQueue.length === 0) {
-    // 找到下一个尚未被确认且当前没有正在被发送的块
-    let nextChunkIndex = -1;
-    for (let i = 0; i < transfer.totalChunks; i++) {
-      // 检查：1. 尚未被接收端确认； 2. 尚未处于待确认状态（即尚未发送）
-      if (!transfer.ackedChunks.has(i) && !transfer.pendingAcks.has(i)) {
-        nextChunkIndex = i;
-        break;
-      }
-    }
-
-    if (nextChunkIndex !== -1) {
-      const start = nextChunkIndex * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, transfer.file.size);
-      const slice = transfer.file.slice(start, end);
-
-      // ****** 核心改动在这里：只推送 chunkIndex 和 originalSliceSize ******
-      peerTransfer.readerQueue.push({ chunkIndex: nextChunkIndex, originalSliceSize: slice.size });
-
-      peerTransfer.readerBusy = true;
-      peerTransfer.reader.readAsArrayBuffer(slice); // 异步读取文件切片
-      // console.log(`Queued chunk ${nextChunkIndex} for FileReader of ${peerId}`);
-      return; // 立即返回，等待 FileReader.onload 回调完成后再继续处理
-    }
-  }
-
-  // --- 3. 检查是否完成 ---
-  // 如果所有分块都已发送并被此对等端确认，则标记此对等端传输完成
-  if (transfer.ackedChunks.size === transfer.totalChunks && !peerTransfer.isPeerComplete) {
-    sendCompletionMessage(dc, fileId);
-    peerTransfer.isPeerComplete = true;
-    console.log(`File ${fileId} transfer completed for peer ${peerId}`);
-    // 检查整体传输是否对所有对等端都已完成
-    checkOverallTransferCompletion(fileId);
-  }
-};
-
-
-
-
-
-const processIncomingChunk = (chunkData, peerId) => {
-  const view = new DataView(chunkData);
-  let offset = 0;
-
-  const fileIdLen = view.getUint8(offset++);
-  const fileIdBytes = new Uint8Array(chunkData, offset, fileIdLen);
-  const fileId = new TextDecoder().decode(fileIdBytes);
-  offset += fileIdLen;
-
-  const chunkIndex = view.getUint32(offset, true); // Little-endian
-  offset += 4;
-
-  const chunkPayload = chunkData.slice(offset); // The actual chunk data
-
-  const file = incomingFiles[fileId];
-  if (!file) {
-    console.warn(`Received chunk ${chunkIndex} for unknown fileId: ${fileId}. Requesting metadata.`);
-    // Optionally request metadata from sender if this happens often:
-    // sendWsMessage('request-metadata', { fileId }, peerId);
-    return;
-  }
-
-  // If already received this chunk, just ACK again (sender might retransmit)
-  if (file.receivedChunks.has(chunkIndex)) {
-    // console.log(`Chunk ${chunkIndex} for ${fileId} already received. Re-ACKing.`);
-    sendChunkAck(fileId, chunkIndex, peerId);
-    return;
-  }
-
-  file.receivedChunks.set(chunkIndex, chunkPayload);
-  file.receivedSize += chunkPayload.byteLength;
-  file.progress = (file.receivedSize / file.size) * 100;
-
-  // Ensure progress doesn't exceed 100
-  if (file.progress > 100) file.progress = 100;
-
-  // Send ACK for the received chunk
-  sendChunkAck(fileId, chunkIndex, peerId);
-
-  // Check if all chunks are received for this file
-  // IMPORTANT: Use >= for receivedSize check to account for potential byte-level differences
-  if (file.receivedChunks.size === file.totalChunks && file.receivedSize >= file.size) {
-      finalizeIncomingFile(fileId, peerId);
-  }
-};
-
-
-const finalizeIncomingFile = (fileId, peerId) => {
-  const file = incomingFiles[fileId];
-  if (!file || file.url) {
-    // Already finalized or not found
-    return;
-  }
-
-  // Validate that we indeed have all chunks, and received size matches total size
-  // This check is slightly relaxed to allow for minor calculation discrepancies
-  const expectedTotalBytes = file.size;
-  const actualReceivedBytes = Array.from(file.receivedChunks.values()).reduce((sum, chunk) => sum + chunk.byteLength, 0);
-
-  if (file.receivedChunks.size !== file.totalChunks || actualReceivedBytes < expectedTotalBytes) {
-      console.warn(`Attempted to finalize file ${file.name} but not all chunks received or size mismatch.
-      Received chunks count: ${file.receivedChunks.size}/${file.totalChunks},
-      Received bytes: ${actualReceivedBytes}/${expectedTotalBytes}.`);
-      errorMessage.value = `文件接收不完整：分块数量或大小不匹配。`;
-      return; // Stop if critical chunk is missing or size mismatch
-  }
-
-
-  // Reconstruct the file
-  const sortedChunks = [];
-  for (let i = 0; i < file.totalChunks; i++) {
-    const chunk = file.receivedChunks.get(i);
-    if (!chunk) {
-      console.error(`CRITICAL: Missing chunk ${i} for file ${file.name}. Cannot finalize.`);
-      errorMessage.value = `文件接收不完整：缺少分块 ${i}。`;
-      return; // Stop if critical chunk is missing
-    }
-    sortedChunks.push(chunk);
-  }
-
-  const blob = new Blob(sortedChunks, { type: file.type });
-  file.url = URL.createObjectURL(blob);
-  file.progress = 100; // Ensure 100% on completion
-
-  console.log(`File ${file.name} (${file.id}) successfully received and reassembled from ${peerId}.`);
-
-  // Optionally revoke previous URLs if the file is updated or re-received
-  // For simplicity, we just create a new one.
-};
 </script>
+
 
 <style scoped>
 /* Your existing CSS can remain here */
