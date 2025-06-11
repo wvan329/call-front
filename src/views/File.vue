@@ -56,8 +56,40 @@ const incomingFileBuffers = {};
 // --- WebRTC Configuration ---
 const RTC_CONFIG = {
   iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-  ]
+    // 主要 Google STUN 服务器
+    { urls: [
+      'stun:stun.l.google.com:19302',
+      'stun:stun1.l.google.com:19302',
+      'stun:stun2.l.google.com:19302',
+      'stun:stun3.l.google.com:19302',
+      'stun:stun4.l.google.com:19302'
+    ]},
+    
+    // 备用公共 STUN 服务器
+    { urls: [
+      'stun:stun.stunprotocol.org:3478',
+      'stun:stun.voipbuster.com:3478',
+      'stun:stun.sipgate.net:3478',
+      'stun:stun.ekiga.net:3478',
+      'stun:stun.services.mozilla.com:3478'
+    ]},
+    
+    // 您自己的 TURN 服务器（强烈建议设置）
+    {
+      urls: 'turn:your-turn-server.com:3478',
+      username: 'your-username',
+      credential: 'your-password'
+    },
+    
+    // 备用 TURN 服务器
+    {
+      urls: 'turn:numb.viagenie.ca:3478',
+      username: 'your-username',
+      credential: 'your-password'
+    }
+  ],
+  iceTransportPolicy: 'all', // 或 relay 如果只需要 TURN
+  iceCandidatePoolSize: 5
 };
 
 // --- File Transfer Constants ---
