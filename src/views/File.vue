@@ -1,33 +1,62 @@
 <template>
-  <div class="file-transfer-container">
-    <h2>File Transfer</h2>
+  <div class="webrtc-file-transfer-container">
+    <h2>WebRTC File Transfer</h2>
 
     <div class="connection-status">
-      WebSocket Status:
-      <span :class="{'status-connected': isConnected, 'status-disconnected': !isConnected}">
-        {{ isConnected ? 'Connected' : 'Disconnected' }}
+      WebSocket Signaling Status:
+      <span :class="{'status-connected': isWsConnected, 'status-disconnected': !isWsConnected}">
+        {{ isWsConnected ? 'Connected' : 'Disconnected' }}
       </span>
-      (ID: {{ currentSessionId }})
+      (My ID: {{ mySessionId || 'Connecting...' }})
     </div>
 
-    <div class="file-input-section">
-      <input type="file" @change="handleFileChange" ref="fileInput" />
-      <button @click="sendFile" :disabled="!selectedFile || !isConnected">Send File</button>
-      <select v-model="selectedRecipientId" class="recipient-select">
-        <option value="">Broadcast (Send to all)</option>
-        <option v-for="sessionId in availableSessions" :key="sessionId" :value="sessionId">
-          {{ sessionId }}
+    <div class="peer-selection-section">
+      <h3>Peer Connection</h3>
+      <select v-model="selectedPeerId" class="peer-select">
+        <option value="">Select a peer to connect</option>
+        <option v-for="peerId in availablePeers" :key="peerId" :value="peerId">
+          {{ peerId }}
         </option>
       </select>
+      <button @click="createOffer" :disabled="!selectedPeerId || !isWsConnected || !!peerConnection">
+        Connect to Peer
+      </button>
+      <button @click="closePeerConnection" :disabled="!peerConnection">
+        Disconnect Peer
+      </button>
+      <p v-if="peerConnection">
+        Peer Connection Status:
+        <span :class="{'status-connected': isPeerConnected, 'status-disconnected': !isPeerConnected}">
+          {{ peerConnection.iceConnectionState }}
+        </span>
+      </p>
+      <p v-if="dataChannel">
+        Data Channel Status:
+        <span :class="{'status-connected': dataChannel.readyState === 'open', 'status-disconnected': dataChannel.readyState !== 'open'}">
+          {{ dataChannel.readyState }}
+        </span>
+      </p>
+    </div>
+
+    <div class="file-transfer-section" v-if="isPeerConnected && dataChannel && dataChannel.readyState === 'open'">
+      <h3>Send File</h3>
+      <input type="file" @change="handleFileChange" ref="fileInput" />
+      <button @click="sendFile" :disabled="!selectedFile || !dataChannel || dataChannel.readyState !== 'open'">
+        Send File
+      </button>
       <p v-if="selectedFile">Selected: {{ selectedFile.name }} ({{ formatBytes(selectedFile.size) }})</p>
-      <p v-if="sendFileError" class="error-message">{{ sendFileError }}</p>
+      <div v-if="sendFileProgress > 0 && sendFileProgress < 100" class="progress-bar-container">
+        <div class="progress-bar" :style="{ width: sendFileProgress + '%' }"></div>
+        <span>{{ sendFileProgress.toFixed(1) }}%</span>
+      </div>
+      <p v-if="fileTransferError" class="error-message">{{ fileTransferError }}</p>
     </div>
 
     <div class="message-log">
-      <h3>Message Log</h3>
+      <h3>Signaling Log</h3>
       <div v-for="(log, index) in messageLogs" :key="index" :class="['log-item', log.type]">
         <span class="log-timestamp">[{{ new Date(log.timestamp).toLocaleTimeString() }}]</span>
-        <span class="log-sender">From: {{ log.from || 'Me' }}</span>
+        <span class="log-sender">From: {{ log.from || 'System' }}</span>
         <span v-if="log.to" class="log-recipient">To: {{ log.to }}</span>
         <span class="log-content">{{ log.content }}</span>
       </div>
@@ -40,6 +69,10 @@
           <p>
             <span class="file-info">From: {{ file.from }} - {{ file.fileName }} ({{ formatBytes(file.fileSize) }})</span>
             <a :href="file.url" :download="file.fileName" class="download-link">Download</a>
+            <div v-if="file.progress < 100" class="progress-bar-container">
+              <div class="progress-bar" :style="{ width: file.progress + '%' }"></div>
+              <span>{{ file.progress.toFixed(1) }}%</span>
+            </div>
           </p>
         </li>
       </ul>
@@ -49,21 +82,43 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, computed } from 'vue';
+import { ref, onMounted, onUnmounted, reactive } from 'vue';
 
 const ws = ref(null);
-const isConnected = ref(false);
-const currentSessionId = ref('');
+const isWsConnected = ref(false);
+const mySessionId = ref(''); // Our own session ID from the server
+const selectedPeerId = ref(''); // The peer we want to connect to
+const availablePeers = ref([]); // List of other connected peers
+
+const peerConnection = ref(null);
+const dataChannel = ref(null);
+const isPeerConnected = ref(false);
+
 const selectedFile = ref(null);
-const receivedFiles = ref([]);
+const sendFileProgress = ref(0);
+const fileTransferError = ref('');
+
 const messageLogs = ref([]);
-const sendFileError = ref('');
-const availableSessions = ref([]); // To store other connected session IDs for point-to-point
-const selectedRecipientId = ref(''); // For selecting a specific recipient
+const receivedFiles = reactive([]); // Use reactive for array of objects
 
-const wsUrl = 'ws://59.110.35.198/wgk/ws'; // Adjust if your WebSocket endpoint is different
+// Temporary storage for incoming file chunks
+const incomingFileBuffers = {}; // { fileId: { metadata: {}, buffer: [], receivedSize: 0, from: '' } }
 
-// Helper to format file size
+// --- WebRTC Configuration ---
+const RTC_CONFIG = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' }, // Google's public STUN server
+    // You might add TURN servers here for more robust NAT traversal
+    // { urls: 'turn:your.turn.server.com:3478', username: 'user', credential: 'password' }
+  ]
+};
+
+// --- File Transfer Constants ---
+const CHUNK_SIZE = 16 * 1024; // 16KB, a common safe chunk size for WebRTC DataChannel
+
+const wsUrl = 'ws://59.110.35.198/wgk/ws'; // Your WebSocket signaling server URL
+
+// --- Utility Functions ---
 const formatBytes = (bytes, decimals = 2) => {
   if (bytes === 0) return '0 Bytes';
   const k = 1024;
@@ -73,7 +128,6 @@ const formatBytes = (bytes, decimals = 2) => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 };
 
-// Log messages for debugging
 const addLog = (type, content, from = null, to = null) => {
   messageLogs.value.push({
     type,
@@ -82,180 +136,447 @@ const addLog = (type, content, from = null, to = null) => {
     to,
     timestamp: Date.now(),
   });
+  // Keep log concise, maybe only last 100 messages
+  if (messageLogs.value.length > 200) {
+    messageLogs.value.splice(0, messageLogs.value.length - 100);
+  }
 };
 
+// --- WebSocket Signaling Logic ---
 const connectWebSocket = () => {
   ws.value = new WebSocket(wsUrl);
 
   ws.value.onopen = () => {
-    isConnected.value = true;
-    addLog('system', 'WebSocket Connected.');
+    isWsConnected.value = true;
+    addLog('system', 'WebSocket Signaling Connected.');
     // Periodically send ping to keep connection alive
     setInterval(() => {
       if (ws.value && ws.value.readyState === WebSocket.OPEN) {
         ws.value.send('ping');
-        // addLog('sent', 'ping'); // Uncomment for verbose ping logging
       }
     }, 25000); // Send ping every 25 seconds
   };
 
   ws.value.onmessage = async (event) => {
     const message = event.data;
-    // addLog('received', `Raw: ${message}`); // Log raw received messages for debugging
 
     if (message === 'pong') {
-      // addLog('received', 'pong'); // Uncomment for verbose pong logging
-      return;
+      return; // Ignore pong messages
     }
 
     try {
       const parsedMessage = JSON.parse(message);
-      const fromId = parsedMessage.from; // Sender's ID from backend
-      const type = parsedMessage.type;
+      const fromId = parsedMessage.from;
 
-      // Update current session ID if this is the first message from the server
-      if (!currentSessionId.value && fromId) {
-        // This is a heuristic: the first message typically contains the session ID.
-        // A more robust way is for the server to explicitly send the session ID.
-        // For Spring's WebSocketSession, the ID is generated server-side.
-        // A simple way to get it is to have the server send a 'connection-info' message.
-        // For now, let's assume `parsedMessage.from` will eventually be our own ID
-        // if we broadcast a message and get it back, or it's implicitly known.
-        // For demonstration, we often don't have direct access to our own session ID
-        // from the client without server sending it explicitly.
-        // Let's set it to 'Me' for now and update later if we get it from a specific server message.
-        // If the server sends {"type": "session-id", "id": "ourId"}, we could capture it.
-        // For this example, we'll rely on the server broadcasting the 'user-left' or a new
-        // connection to imply other sessions, and not show our own ID unless we receive it.
-        // To properly get own ID, server needs to send it. For now, we'll display 'Me' for own actions.
-        // The server puts `from` field for *other* sessions, so 'Me' is fine for client's perspective.
-        // We can get the ID when `afterConnectionEstablished` happens on server and server sends it.
+      // Update our own session ID if the server sends it (e.g., "Connected: sessionId")
+      // This is a simple heuristic; ideally, the server explicitly sends "my-id"
+      if (!mySessionId.value && message.startsWith("Connected: ")) {
+          mySessionId.value = message.substring("Connected: ".length);
+          addLog('system', `My session ID is: ${mySessionId.value}`);
+      } else if (parsedMessage.type === 'session-id' && parsedMessage.id) {
+          mySessionId.value = parsedMessage.id;
+          addLog('system', `My session ID is: ${mySessionId.value}`);
       }
 
 
-      // --- Handle different message types ---
-      if (type === 'file') {
-        const { fileName, fileType, data, from } = parsedMessage;
-        addLog('received', `File: ${fileName} (${formatBytes(atob(data).length)})`, from);
-        // Decode Base64 to ArrayBuffer
-        const byteCharacters = atob(data);
-        const byteNumbers = new Array(byteCharacters.length);
-        for (let i = 0; i < byteCharacters.length; i++) {
-          byteNumbers[i] = byteCharacters.charCodeAt(i);
-        }
-        const byteArray = new Uint8Array(byteNumbers);
-        const blob = new Blob([byteArray], { type: fileType });
-        const url = URL.createObjectURL(blob);
+      // --- Update available peers list ---
+      // Filter out our own ID and duplicates
+      const newPeers = new Set(availablePeers.value);
+      if (fromId && fromId !== mySessionId.value) {
+          newPeers.add(fromId);
+      }
+      // If a user-left message comes, remove them
+      if (parsedMessage.type === 'user-left') {
+          newPeers.delete(parsedMessage.from);
+          addLog('system', `Peer disconnected: ${parsedMessage.from}`);
+          // If the disconnected peer was our selected peer, clear selection
+          if (selectedPeerId.value === parsedMessage.from) {
+              selectedPeerId.value = '';
+              closePeerConnection(); // Close our RTCPeerConnection if peer disconnected
+          }
+      }
+      availablePeers.value = Array.from(newPeers);
 
-        receivedFiles.value.push({
-          fileName,
-          fileType,
-          fileSize: byteArray.length,
-          url,
-          from: from || 'Unknown', // 'from' should always be present from backend
-        });
-      } else if (type === 'user-left') {
-        // Update available sessions list
-        const leftUserId = parsedMessage.from;
-        availableSessions.value = availableSessions.value.filter(id => id !== leftUserId);
-        addLog('system', `User disconnected: ${leftUserId}`);
+
+      // --- Handle WebRTC Signaling Messages ---
+      if (parsedMessage.type === 'offer') {
+        addLog('received', `Received WebRTC Offer from ${fromId}`, from);
+        await handleOffer(parsedMessage.sdp, fromId);
+      } else if (parsedMessage.type === 'answer') {
+        addLog('received', `Received WebRTC Answer from ${fromId}`, from);
+        await handleAnswer(parsedMessage.sdp);
+      } else if (parsedMessage.type === 'candidate') {
+        addLog('received', `Received ICE Candidate from ${fromId}`, from);
+        await handleCandidate(parsedMessage.candidate);
+      } else if (parsedMessage.type === 'file-metadata-signal') {
+          // This is a signaling message for file metadata, handled by the data channel logic
+          // No direct action here, it's just forwarded via signaling
+          addLog('received', `File metadata signaling message from ${fromId}`, from);
       } else {
-        // This is a generic signaling message or other text message
-        addLog('received', `JSON: ${JSON.stringify(parsedMessage)}`, from, parsedMessage.to);
-
-        // For simplicity, let's assume any incoming message's 'from' is a potential peer
-        // Exclude our own session ID if we knew it, or if it's the 'from' field of our broadcast
-        if (fromId && fromId !== currentSessionId.value && !availableSessions.value.includes(fromId)) {
-            availableSessions.value.push(fromId);
-        }
+        // Generic messages (like initial 'Connected: xxx')
+        addLog('received', `Signaling: ${JSON.stringify(parsedMessage)}`, from, parsedMessage.to);
       }
     } catch (e) {
-      // If it's not JSON, it might be a simple text message (like the initial "Connected: sessionId" from server)
-      addLog('received', `Text: ${message}`);
-      if (message.startsWith("Connected: ")) {
-          currentSessionId.value = message.substring("Connected: ".length);
-      }
+      addLog('error', `Error parsing message or unknown text: ${message}. Error: ${e.message}`);
     }
   };
 
   ws.value.onclose = () => {
-    isConnected.value = false;
-    currentSessionId.value = '';
-    addLog('system', 'WebSocket Disconnected. Attempting to reconnect in 5 seconds...');
-    setTimeout(connectWebSocket, 5000); // Attempt to reconnect
+    isWsConnected.value = false;
+    addLog('system', 'WebSocket Signaling Disconnected. Attempting to reconnect in 5 seconds...');
+    setTimeout(connectWebSocket, 5000);
   };
 
   ws.value.onerror = (error) => {
     addLog('error', `WebSocket Error: ${error.message || error}`);
-    ws.value.close(); // Close to trigger onclose and reconnect
+    ws.value.close();
   };
 };
 
+// --- WebRTC Peer Connection Logic ---
+const createPeerConnection = (targetPeerId) => {
+  if (peerConnection.value) {
+    addLog('system', 'Existing peer connection found, closing it.');
+    closePeerConnection();
+  }
+
+  addLog('system', `Creating RTCPeerConnection for ${targetPeerId}`);
+  peerConnection.value = new RTCPeerConnection(RTC_CONFIG);
+  isPeerConnected.value = false; // Reset status
+
+  peerConnection.value.onicecandidate = (event) => {
+    if (event.candidate) {
+      addLog('system', `Sending ICE Candidate to ${targetPeerId}`);
+      ws.value.send(JSON.stringify({
+        type: 'candidate',
+        candidate: event.candidate,
+        to: targetPeerId
+      }));
+    }
+  };
+
+  peerConnection.value.oniceconnectionstatechange = () => {
+    addLog('system', `ICE Connection State: ${peerConnection.value.iceConnectionState}`);
+    isPeerConnected.value = (peerConnection.value.iceConnectionState === 'connected' || peerConnection.value.iceConnectionState === 'completed');
+    if (peerConnection.value.iceConnectionState === 'failed' || peerConnection.value.iceConnectionState === 'disconnected') {
+      addLog('error', `ICE Connection Failed or Disconnected. Closing peer connection.`);
+      closePeerConnection();
+    }
+  };
+
+  peerConnection.value.ondatachannel = (event) => {
+    addLog('system', `Received DataChannel from peer: ${event.channel.label}`);
+    dataChannel.value = event.channel;
+    setupDataChannelListeners(dataChannel.value);
+  };
+
+  // Create a data channel immediately if we are the offerer
+  dataChannel.value = peerConnection.value.createDataChannel("file-transfer-channel", {
+    ordered: true, // Guarantees order
+    maxRetransmits: 0 // Optional: no retransmits for faster but less reliable transfer
+  });
+  addLog('system', 'Created DataChannel for file transfer.');
+  setupDataChannelListeners(dataChannel.value);
+};
+
+const setupDataChannelListeners = (channel) => {
+  channel.onopen = () => {
+    addLog('system', `DataChannel opened: ${channel.label}`);
+    // Clear any previous error messages related to DC state
+    fileTransferError.value = '';
+  };
+
+  channel.onclose = () => {
+    addLog('system', `DataChannel closed: ${channel.label}`);
+    dataChannel.value = null; // Clear reference
+    sendFileProgress.value = 0; // Reset progress
+  };
+
+  channel.onerror = (error) => {
+    addLog('error', `DataChannel Error: ${error.message || error}`);
+    fileTransferError.value = `Data channel error: ${error.message || 'Unknown error'}`;
+  };
+
+  channel.onmessage = async (event) => {
+    // WebRTC DataChannel can send ArrayBuffer directly!
+    const receivedData = event.data;
+
+    try {
+      if (typeof receivedData === 'string') {
+        // This is likely a JSON signaling message for file transfer (metadata or completion)
+        const parsedData = JSON.parse(receivedData);
+        if (parsedData.type === 'file-metadata-signal') {
+          const { fileId, fileName, fileType, fileSize } = parsedData;
+          addLog('received', `Received file metadata for ${fileName} (ID: ${fileId}) from peer`);
+          incomingFileBuffers[fileId] = {
+            metadata: { fileName, fileType, fileSize },
+            chunks: [], // Store ArrayBuffer chunks
+            receivedSize: 0,
+            from: selectedPeerId.value, // The sender is the connected peer
+            progress: 0,
+            index: receivedFiles.length // To display it in order
+          };
+          receivedFiles.push(incomingFileBuffers[fileId]); // Add to display list immediately
+        } else if (parsedData.type === 'file-transfer-complete-signal') {
+          const { fileId, fileName } = parsedData;
+          addLog('received', `File transfer complete signal for ${fileName} (ID: ${fileId})`);
+          // File reassembly logic happens at the last chunk. This is just a confirmation.
+        } else {
+          addLog('received', `DataChannel String: ${receivedData}`);
+        }
+      } else if (receivedData instanceof ArrayBuffer) {
+        // This is a binary file chunk!
+        const view = new DataView(receivedData);
+        const fileIdLen = view.getUint8(0);
+        const fileId = new TextDecoder().decode(receivedData.slice(1, 1 + fileIdLen));
+        const chunkIndex = view.getUint32(1 + fileIdLen, true); // true for little-endian
+        const isLastChunk = view.getUint8(1 + fileIdLen + 4) === 1;
+        const chunkData = receivedData.slice(1 + fileIdLen + 4 + 1); // Remaining is actual data
+
+        if (!incomingFileBuffers[fileId]) {
+          addLog('error', `Received file chunk for unknown file ID: ${fileId}. Metadata might be missing.`);
+          return;
+        }
+
+        const fileBuffer = incomingFileBuffers[fileId];
+        fileBuffer.chunks[chunkIndex] = chunkData;
+        fileBuffer.receivedSize += chunkData.byteLength;
+        fileBuffer.progress = (fileBuffer.receivedSize / fileBuffer.metadata.fileSize) * 100;
+
+        // Update the reactive receivedFiles array for progress display
+        const reactiveFileItem = receivedFiles.find(item => item.index === fileBuffer.index);
+        if (reactiveFileItem) {
+            reactiveFileItem.progress = fileBuffer.progress;
+        }
+
+        // addLog('received', `Received chunk ${chunkIndex} for ${fileBuffer.metadata.fileName} (ID: ${fileId})`);
+
+        if (isLastChunk) {
+          addLog('received', `Last chunk received for ${fileBuffer.metadata.fileName} (ID: ${fileId}). Reassembling...`);
+          const fullBuffer = concatenateArrayBuffers(fileBuffer.chunks);
+          const blob = new Blob([fullBuffer], { type: fileBuffer.metadata.fileType });
+          const url = URL.createObjectURL(blob);
+
+          // Find the item in receivedFiles and update its URL
+          if (reactiveFileItem) {
+              reactiveFileItem.url = url;
+              reactiveFileItem.progress = 100; // Ensure it shows 100%
+          }
+
+          delete incomingFileBuffers[fileId]; // Clean up buffer
+          addLog('system', `File reassembled and ready for download: ${fileBuffer.metadata.fileName}`);
+        }
+      }
+    } catch (e) {
+      addLog('error', `Error processing DataChannel message: ${e.message}`);
+    }
+  };
+};
+
+
+const concatenateArrayBuffers = (buffers) => {
+    let totalLength = 0;
+    for (const buffer of buffers) {
+        if (buffer) { // Ensure buffer exists for sparse arrays
+            totalLength += buffer.byteLength;
+        }
+    }
+
+    const result = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const buffer of buffers) {
+        if (buffer) {
+            result.set(new Uint8Array(buffer), offset);
+            offset += buffer.byteLength;
+        }
+    }
+    return result.buffer;
+};
+
+
+const closePeerConnection = () => {
+  if (dataChannel.value) {
+    dataChannel.value.close();
+    dataChannel.value = null;
+  }
+  if (peerConnection.value) {
+    peerConnection.value.close();
+    peerConnection.value = null;
+  }
+  isPeerConnected.value = false;
+  addLog('system', 'Peer connection closed.');
+};
+
+// --- WebRTC Signaling Message Handlers (Send to signaling server) ---
+const sendSignalingMessage = (type, payload) => {
+    if (ws.value && ws.value.readyState === WebSocket.OPEN && selectedPeerId.value) {
+        const message = {
+            type: type,
+            to: selectedPeerId.value,
+            ...payload
+        };
+        ws.value.send(JSON.stringify(message));
+    } else {
+        addLog('error', `Cannot send signaling message: WS not open or no peer selected for ${type}`);
+    }
+};
+
+const createOffer = async () => {
+  if (!selectedPeerId.value) {
+    fileTransferError.value = 'Please select a peer to connect to.';
+    return;
+  }
+  createPeerConnection(selectedPeerId.value); // Re-create connection for new offer
+
+  try {
+    const offer = await peerConnection.value.createOffer();
+    await peerConnection.value.setLocalDescription(offer);
+    sendSignalingMessage('offer', { sdp: offer });
+    addLog('sent', `Sent WebRTC Offer to ${selectedPeerId.value}`);
+  } catch (error) {
+    addLog('error', `Error creating offer: ${error.message}`);
+    fileTransferError.value = `Error creating offer: ${error.message}`;
+  }
+};
+
+const handleOffer = async (sdp, fromId) => {
+  // If we receive an offer, we are the answerer
+  // Ensure we are talking to the same peer (or allow new connection)
+  if (peerConnection.value && selectedPeerId.value !== fromId && isPeerConnected.value) {
+    addLog('system', `Already connected to a peer. Ignoring offer from ${fromId}.`);
+    return; // Or handle multiple peer connections if desired
+  }
+  selectedPeerId.value = fromId; // Automatically set the peer we are answering
+  createPeerConnection(fromId); // Create connection for answering
+
+  try {
+    await peerConnection.value.setRemoteDescription(new RTCSessionDescription(sdp));
+    const answer = await peerConnection.value.createAnswer();
+    await peerConnection.value.setLocalDescription(answer);
+    sendSignalingMessage('answer', { sdp: answer });
+    addLog('sent', `Sent WebRTC Answer to ${fromId}`);
+  } catch (error) {
+    addLog('error', `Error handling offer: ${error.message}`);
+    fileTransferError.value = `Error handling offer: ${error.message}`;
+  }
+};
+
+const handleAnswer = async (sdp) => {
+  try {
+    await peerConnection.value.setRemoteDescription(new RTCSessionDescription(sdp));
+  } catch (error) {
+    addLog('error', `Error handling answer: ${error.message}`);
+    fileTransferError.value = `Error handling answer: ${error.message}`;
+  }
+};
+
+const handleCandidate = async (candidate) => {
+  try {
+    await peerConnection.value.addIceCandidate(new RTCIceCandidate(candidate));
+  } catch (error) {
+    addLog('error', `Error adding ICE candidate: ${error.message}`);
+    // fileTransferError.value = `Error adding ICE candidate: ${error.message}`; // Too verbose
+  }
+};
+
+// --- File Selection & Sending Logic ---
 const handleFileChange = (event) => {
   selectedFile.value = event.target.files[0];
-  sendFileError.value = ''; // Clear previous errors
+  sendFileProgress.value = 0;
+  fileTransferError.value = '';
 };
 
 const sendFile = async () => {
-  if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
-    sendFileError.value = 'WebSocket is not connected.';
+  if (!dataChannel.value || dataChannel.value.readyState !== 'open') {
+    fileTransferError.value = 'Data Channel is not open. Please establish a peer connection first.';
     return;
   }
   if (!selectedFile.value) {
-    sendFileError.value = 'No file selected.';
+    fileTransferError.value = 'No file selected.';
     return;
   }
 
+  const file = selectedFile.value;
+  const fileId = `${mySessionId.value}-${Date.now()}-${file.name}`; // Unique ID for this file transfer
+
+  // 1. Send file metadata over the data channel (as a JSON string)
+  const metadata = {
+    type: 'file-metadata-signal', // This type is for the *data channel* listener
+    fileId: fileId,
+    fileName: file.name,
+    fileType: file.type || 'application/octet-stream',
+    fileSize: file.size,
+    from: mySessionId.value // Let receiver know who sent it
+  };
+  dataChannel.value.send(JSON.stringify(metadata));
+  addLog('sent', `Sent file metadata to peer for ${file.name} (ID: ${fileId})`);
+
+  // 2. Send file chunks as ArrayBuffer
+  let offset = 0;
+  sendFileProgress.value = 0;
   const reader = new FileReader();
 
   reader.onload = (e) => {
-    try {
-      const arrayBuffer = e.target.result;
-      const base64String = btoa(
-        new Uint8Array(arrayBuffer)
-          .reduce((data, byte) => data + String.fromCharCode(byte), '')
-      );
+    const chunk = e.target.result; // This is an ArrayBuffer
+    const header = new Uint8Array(1 + 4 + 1 + new TextEncoder().encode(fileId).byteLength); // fileIdLen (1 byte) + fileId + chunkIndex (4 bytes) + isLastChunk (1 byte)
+    let headerOffset = 0;
 
-      const messagePayload = {
-        type: 'file',
-        fileName: selectedFile.value.name,
-        fileType: selectedFile.value.type || 'application/octet-stream', // Fallback type
-        fileSize: selectedFile.value.size,
-        data: base64String,
-      };
+    // Encode fileId
+    const fileIdBytes = new TextEncoder().encode(fileId);
+    header[headerOffset++] = fileIdBytes.byteLength; // Length of fileId
+    header.set(fileIdBytes, headerOffset);
+    headerOffset += fileIdBytes.byteLength;
 
-      if (selectedRecipientId.value) {
-        messagePayload.to = selectedRecipientId.value;
-        addLog('sent', `Sending file to ${selectedRecipientId.value}: ${selectedFile.value.name}`, 'Me', selectedRecipientId.value);
-      } else {
-        addLog('sent', `Broadcasting file: ${selectedFile.value.name}`, 'Me');
-      }
+    // Encode chunkIndex
+    const chunkIndex = Math.floor(offset / CHUNK_SIZE);
+    new DataView(header.buffer).setUint32(headerOffset, chunkIndex, true); // true for little-endian
+    headerOffset += 4;
 
-      ws.value.send(JSON.stringify(messagePayload));
-      selectedFile.value = null; // Clear selected file after sending
-      if (currentSessionId.value === selectedRecipientId.value || !selectedRecipientId.value) {
-         // If broadcasting or sending to self, we'll receive our own message, so don't clear until then
-         // But for a true point-to-point where we don't receive our own send, clear it here.
-         // For simplicity, let's clear it regardless.
-      }
-      // Clear file input visually
+    // Encode isLastChunk
+    const isLastChunk = (offset + chunk.byteLength) >= file.size;
+    header[headerOffset++] = isLastChunk ? 1 : 0;
+
+    // Concatenate header and chunk data
+    const combinedBuffer = new Uint8Array(header.byteLength + chunk.byteLength);
+    combinedBuffer.set(header, 0);
+    combinedBuffer.set(new Uint8Array(chunk), header.byteLength);
+
+    dataChannel.value.send(combinedBuffer.buffer); // Send ArrayBuffer!
+
+    offset += chunk.byteLength;
+    sendFileProgress.value = (offset / file.size) * 100;
+
+    if (offset < file.size) {
+      readNextChunk();
+    } else {
+      addLog('sent', `Finished sending all chunks for ${file.name}`);
+      // Send a final completion signal over the data channel (as JSON string)
+      dataChannel.value.send(JSON.stringify({
+        type: 'file-transfer-complete-signal',
+        fileId: fileId,
+        fileName: file.name,
+        from: mySessionId.value
+      }));
+      selectedFile.value = null; // Clear selected file
       if (document.querySelector('input[type="file"]')) {
         document.querySelector('input[type="file"]').value = '';
       }
-
-    } catch (error) {
-      console.error('Error sending file:', error);
-      sendFileError.value = 'Error processing file: ' + error.message;
     }
   };
 
   reader.onerror = (error) => {
     console.error('FileReader error:', error);
-    sendFileError.value = 'Error reading file: ' + error.message;
+    fileTransferError.value = 'Error reading file: ' + error.message;
   };
 
-  reader.readAsArrayBuffer(selectedFile.value);
+  const readNextChunk = () => {
+    const slice = file.slice(offset, offset + CHUNK_SIZE);
+    reader.readAsArrayBuffer(slice);
+  };
+
+  readNextChunk(); // Start reading the first chunk
 };
+
 
 onMounted(() => {
   connectWebSocket();
@@ -265,11 +586,15 @@ onUnmounted(() => {
   if (ws.value) {
     ws.value.close();
   }
+  if (peerConnection.value) {
+    peerConnection.value.close();
+  }
 });
 </script>
 
 <style scoped>
-.file-transfer-container {
+/* Keep your existing CSS styles from the previous example */
+.webrtc-file-transfer-container {
   font-family: Arial, sans-serif;
   max-width: 800px;
   margin: 20px auto;
@@ -287,7 +612,7 @@ h2, h3 {
   padding-bottom: 5px;
 }
 
-.connection-status {
+.connection-status, .peer-selection-section {
   margin-bottom: 20px;
   padding: 10px;
   background-color: #eef;
@@ -305,51 +630,76 @@ h2, h3 {
   font-weight: bold;
 }
 
-.file-input-section {
-  margin-bottom: 20px;
-  padding: 15px;
-  background-color: #fff;
-  border: 1px solid #eee;
+.peer-select, .file-transfer-section input[type="file"],
+.file-transfer-section button {
+  margin-right: 10px;
+  padding: 8px 12px;
+  border: 1px solid #ccc;
   border-radius: 4px;
 }
 
-.file-input-section input[type="file"] {
-  margin-right: 10px;
-  padding: 5px;
+.peer-select {
+    min-width: 200px;
 }
 
-.file-input-section button {
-  padding: 8px 15px;
+.peer-selection-section button, .file-transfer-section button {
   background-color: #007bff;
   color: white;
   border: none;
-  border-radius: 4px;
   cursor: pointer;
   transition: background-color 0.3s ease;
-  margin-right: 10px;
 }
 
-.file-input-section button:disabled {
+.peer-selection-section button:disabled, .file-transfer-section button:disabled {
   background-color: #cccccc;
   cursor: not-allowed;
 }
 
-.file-input-section button:hover:enabled {
+.peer-selection-section button:hover:enabled, .file-transfer-section button:hover:enabled {
   background-color: #0056b3;
 }
 
-.file-input-section p {
-  margin-top: 10px;
-  color: #555;
+.file-transfer-section {
+    margin-top: 20px;
+    padding: 15px;
+    background-color: #fff;
+    border: 1px solid #eee;
+    border-radius: 4px;
 }
 
-.recipient-select {
-  padding: 7px;
-  border: 1px solid #ccc;
-  border-radius: 4px;
-  margin-left: 10px;
-  min-width: 150px;
+.file-transfer-section p {
+    margin-top: 10px;
+    color: #555;
 }
+
+.progress-bar-container {
+  width: 100%;
+  background-color: #e0e0e0;
+  border-radius: 5px;
+  margin-top: 10px;
+  height: 20px;
+  position: relative;
+}
+
+.progress-bar {
+  height: 100%;
+  background-color: #4CAF50;
+  border-radius: 5px;
+  text-align: center;
+  color: white;
+  transition: width 0.1s ease-out; /* Smooth progress update */
+}
+
+.progress-bar-container span {
+    position: absolute;
+    width: 100%;
+    text-align: center;
+    line-height: 20px;
+    color: #333;
+    font-size: 0.9em;
+    font-weight: bold;
+}
+
 
 .message-log {
   margin-top: 20px;
@@ -366,6 +716,7 @@ h2, h3 {
   border-bottom: 1px dotted #eee;
   font-size: 0.9em;
   color: #666;
+  text-align: left;
 }
 
 .log-item:last-child {
@@ -412,6 +763,7 @@ h2, h3 {
 .received-file-item {
   padding: 10px 0;
   border-bottom: 1px dotted #eee;
+  text-align: left;
 }
 
 .received-file-item:last-child {
