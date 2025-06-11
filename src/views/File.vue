@@ -54,6 +54,235 @@
 
 
 
+// =============== 修改后的文件传输核心逻辑 ===============
+
+// 为每个传输任务创建独立的 FileReader
+const createFileReader = () => {
+  const reader = new FileReader();
+  let isReading = false;
+  
+  return {
+    readAsArrayBuffer(blob) {
+      return new Promise((resolve, reject) => {
+        if (isReading) {
+          reject(new Error('FileReader is busy'));
+          return;
+        }
+        
+        isReading = true;
+        reader.onload = (e) => {
+          isReading = false;
+          resolve(e.target.result);
+        };
+        reader.onerror = (e) => {
+          isReading = false;
+          reject(e.target.error);
+        };
+        reader.readAsArrayBuffer(blob);
+      });
+    }
+  };
+};
+
+// 增强的数据通道发送逻辑
+const sendWithRetry = async (dc, data, maxRetries = 3) => {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      if (dc.readyState !== 'open') {
+        throw new Error('DataChannel is not open');
+      }
+      
+      dc.send(data);
+      return true;
+    } catch (e) {
+      if (attempt === maxRetries) throw e;
+      
+      // 等待指数退避时间后重试
+      await new Promise(resolve => 
+        setTimeout(resolve, 100 * Math.pow(2, attempt))
+      );
+    }
+  }
+};
+
+// 重构的 sendNextChunk 函数
+const sendNextChunk = async (peerId, streamIndex) => {
+  const stream = peerConnections[peerId]?.streams[streamIndex];
+  if (!stream || !stream.currentTransfer) return;
+
+  const { dc, currentTransfer } = stream;
+  const { file, fileId, currentOffset, endOffset } = currentTransfer;
+
+  // 检查是否完成
+  if (currentOffset >= endOffset) {
+    try {
+      await sendTransferComplete(dc, fileId);
+      currentTransfer.resolve();
+    } catch (e) {
+      currentTransfer.reject(e);
+    } finally {
+      stream.currentTransfer = null;
+      processStreamQueue(peerId, streamIndex);
+    }
+    return;
+  }
+
+  try {
+    // 读取下一个块
+    const nextChunkSize = Math.min(CHUNK_SIZE, endOffset - currentOffset);
+    const slice = file.slice(currentOffset, currentOffset + nextChunkSize);
+    const chunk = await currentTransfer.reader.readAsArrayBuffer(slice);
+    
+    // 准备数据包
+    const chunkIndex = Math.floor(currentOffset / CHUNK_SIZE);
+    const isLastChunk = (currentOffset + chunk.byteLength) >= endOffset;
+    const packet = createDataPacket(fileId, chunkIndex, isLastChunk, chunk);
+    
+    // 发送数据
+    await sendWithRetry(dc, packet);
+    
+    // 更新状态
+    currentTransfer.currentOffset += chunk.byteLength;
+    updateTransferStats(chunk.byteLength);
+    
+    // 更新进度
+    const totalSent = currentTransfer.currentOffset - currentTransfer.startOffset;
+    const totalToSend = currentTransfer.endOffset - currentTransfer.startOffset;
+    transferStats.progress = Math.min(
+      ...peerConnections[peerId].streams
+        .filter(s => s.currentTransfer?.fileId === fileId)
+        .map(s => {
+          const sent = s.currentTransfer.currentOffset - s.currentTransfer.startOffset;
+          const total = s.currentTransfer.endOffset - s.currentTransfer.startOffset;
+          return (sent / total) * 100;
+        })
+    );
+    
+    // 如果还有空间且数据未发送完，继续发送
+    if (currentTransfer.currentOffset < endOffset && dc.bufferedAmount < MAX_BUFFER_SIZE * 0.8) {
+      sendNextChunk(peerId, streamIndex);
+    }
+  } catch (e) {
+    console.error('发送块失败:', e);
+    currentTransfer.reject(e);
+    stream.currentTransfer = null;
+    
+    // 如果是连接问题，关闭整个PeerConnection
+    if (e.message.includes('not open') || e.message.includes('Failure to send')) {
+      closePeerConnection(peerId);
+    }
+  }
+};
+
+// 增强的传输任务创建
+const createTransferTask = (file, peerId, streamIndex, startOffset, endOffset) => {
+  const fileId = generateFileId();
+  
+  return {
+    file,
+    fileId,
+    startOffset,
+    endOffset,
+    currentOffset: startOffset,
+    reader: createFileReader(), // 使用独立的FileReader
+    streamIndex,
+    resolve: null,
+    reject: null,
+    promise: new Promise((resolve, reject) => {
+      this.resolve = resolve;
+      this.reject = reject;
+    })
+  };
+};
+
+// 修改后的 sendFileToPeer
+const sendFileToPeer = (peerId, file) => {
+  if (!peerConnections[peerId]) {
+    throw new Error(`没有与 ${peerId} 的连接`);
+  }
+  
+  const fileSize = file.size;
+  const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
+  const chunksPerStream = Math.ceil(totalChunks / PARALLEL_STREAMS);
+  
+  // 为每个流创建传输任务
+  const transferPromises = peerConnections[peerId].streams.map((stream, index) => {
+    const startChunk = index * chunksPerStream;
+    const endChunk = Math.min((index + 1) * chunksPerStream, totalChunks);
+    
+    if (startChunk >= endChunk) {
+      return Promise.resolve(); // 这个流不需要传输数据
+    }
+    
+    const startOffset = startChunk * CHUNK_SIZE;
+    const endOffset = Math.min(endChunk * CHUNK_SIZE, fileSize);
+    
+    const transfer = createTransferTask(file, peerId, index, startOffset, endOffset);
+    stream.queue.push(transfer);
+    processStreamQueue(peerId, index);
+    
+    return transfer.promise;
+  });
+  
+  return Promise.all(transferPromises);
+};
+
+// 增强的 closePeerConnection
+const closePeerConnection = (peerId) => {
+  if (!peerConnections[peerId]) return;
+  
+  // 拒绝所有未完成的传输
+  peerConnections[peerId].streams.forEach(stream => {
+    stream.queue.forEach(transfer => transfer.reject(new Error('Connection closed')));
+    if (stream.currentTransfer) {
+      stream.currentTransfer.reject(new Error('Connection closed'));
+    }
+    stream.queue = [];
+    stream.currentTransfer = null;
+    
+    // 关闭数据通道
+    if (stream.dc) {
+      try {
+        stream.dc.close();
+      } catch (e) {
+        console.error('关闭数据通道错误:', e);
+      }
+    }
+  });
+  
+  // 关闭PeerConnection
+  if (peerConnections[peerId].pc) {
+    try {
+      peerConnections[peerId].pc.close();
+    } catch (e) {
+      console.error('关闭PeerConnection错误:', e);
+    }
+  }
+  
+  delete peerConnections[peerId];
+  console.log(`已关闭与 ${peerId} 的连接`);
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 // =============== 新增的 WebSocket 消息处理函数 ===============
@@ -422,23 +651,6 @@ const setupDataChannel = (dc, peerId, streamIndex) => {
   };
 };
 
-const closePeerConnection = (peerId) => {
-  if (!peerConnections[peerId]) return;
-
-  console.log(`关闭与 ${peerId} 的连接`);
-
-  // 关闭所有数据通道
-  peerConnections[peerId].streams.forEach(stream => {
-    if (stream.dc) stream.dc.close();
-  });
-
-  // 关闭 PeerConnection
-  if (peerConnections[peerId].pc) {
-    peerConnections[peerId].pc.close();
-  }
-
-  delete peerConnections[peerId];
-};
 
 // =============== 文件传输逻辑 ===============
 const handleFileChange = (event) => {
@@ -482,50 +694,6 @@ const sendFileBroadcast = async () => {
   }
 };
 
-const sendFileToPeer = (peerId, file) => {
-  if (!peerConnections[peerId]) {
-    throw new Error(`没有与 ${peerId} 的连接`);
-  }
-
-  const fileId = generateFileId();
-  const fileSize = file.size;
-  const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
-  const chunksPerStream = Math.ceil(totalChunks / PARALLEL_STREAMS);
-
-  // 为每个流创建传输任务
-  const transferPromises = peerConnections[peerId].streams.map((stream, index) => {
-    return new Promise((resolve, reject) => {
-      const startChunk = index * chunksPerStream;
-      const endChunk = Math.min((index + 1) * chunksPerStream, totalChunks);
-
-      if (startChunk >= endChunk) {
-        resolve(); // 这个流不需要传输数据
-        return;
-      }
-
-      const startOffset = startChunk * CHUNK_SIZE;
-      const endOffset = Math.min(endChunk * CHUNK_SIZE, fileSize);
-
-      const transfer = {
-        file,
-        fileId,
-        startOffset,
-        endOffset,
-        currentOffset: startOffset,
-        reader: new FileReader(),
-        resolve,
-        reject,
-        streamIndex: index
-      };
-
-      stream.queue.push(transfer);
-      processStreamQueue(peerId, index);
-    });
-  });
-
-  return Promise.all(transferPromises);
-};
-
 const processStreamQueue = (peerId, streamIndex) => {
   const stream = peerConnections[peerId]?.streams[streamIndex];
   if (!stream || !stream.dc || stream.dc.readyState !== 'open') return;
@@ -561,75 +729,6 @@ const sendFileMetadata = (dc, transfer) => {
   }
 };
 
-const sendNextChunk = (peerId, streamIndex) => {
-  const stream = peerConnections[peerId]?.streams[streamIndex];
-  if (!stream || !stream.currentTransfer) return;
-
-  const { dc, currentTransfer } = stream;
-  const { file, fileId, currentOffset, endOffset } = currentTransfer;
-
-  // 检查是否完成
-  if (currentOffset >= endOffset) {
-    sendTransferComplete(dc, fileId);
-    currentTransfer.resolve();
-    stream.currentTransfer = null;
-    processStreamQueue(peerId, streamIndex); // 处理下一个传输
-    return;
-  }
-
-  // 计算下一个块
-  const nextChunkSize = Math.min(CHUNK_SIZE, endOffset - currentOffset);
-  const slice = file.slice(currentOffset, currentOffset + nextChunkSize);
-  currentTransfer.reader.readAsArrayBuffer(slice);
-
-  currentTransfer.reader.onload = (e) => {
-    const chunk = e.target.result;
-    const chunkIndex = Math.floor(currentOffset / CHUNK_SIZE);
-    const isLastChunk = (currentOffset + chunk.byteLength) >= endOffset;
-
-    try {
-      const packet = createDataPacket(fileId, chunkIndex, isLastChunk, chunk);
-
-      // 更新传输统计
-      updateTransferStats(chunk.byteLength);
-
-      // 发送数据
-      dc.send(packet);
-      currentTransfer.currentOffset += chunk.byteLength;
-
-      // 更新进度
-      const totalSent = currentTransfer.currentOffset - currentTransfer.startOffset;
-      const totalToSend = currentTransfer.endOffset - currentTransfer.startOffset;
-      const streamProgress = (totalSent / totalToSend) * 100;
-
-      // 全局进度是所有流进度的最小值
-      const allStreams = peerConnections[peerId].streams
-        .filter(s => s.currentTransfer?.fileId === fileId)
-        .map(s => {
-          const sent = s.currentTransfer.currentOffset - s.currentTransfer.startOffset;
-          const total = s.currentTransfer.endOffset - s.currentTransfer.startOffset;
-          return (sent / total) * 100;
-        });
-
-      transferStats.progress = Math.min(...allStreams);
-
-      // 如果还有空间且数据未发送完，继续发送
-      if (currentTransfer.currentOffset < endOffset && dc.bufferedAmount < MAX_BUFFER_SIZE * 0.8) {
-        sendNextChunk(peerId, streamIndex);
-      }
-    } catch (e) {
-      console.error('发送数据块失败:', e);
-      currentTransfer.reject(e);
-      stream.currentTransfer = null;
-    }
-  };
-
-  currentTransfer.reader.onerror = (error) => {
-    console.error('文件读取错误:', error);
-    currentTransfer.reject(error);
-    stream.currentTransfer = null;
-  };
-};
 
 const updateTransferStats = (bytesSent) => {
   const now = Date.now();
