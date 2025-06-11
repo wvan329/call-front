@@ -1,21 +1,21 @@
 <template>
   <div class="webrtc-file-transfer-container">
-    <h2>WebRTC 极速文件传输</h2>
+    <h2>WebRTC 文件传输</h2>
 
     <div class="connection-info">
-      <h3>连接状态</h3>
+      <!-- <h3>连接状态</h3>
       <p>我的会话ID: <span class="my-id">{{ mySessionId || '未连接' }}</span></p>
       <p>WebSocket 状态:
         <span :class="wsStatus.class">{{ wsStatus.text }}</span>
-      </p>
-      <p>活跃对等端: <span class="connected-peers-count">{{ activePeersCount }}</span></p>
+      </p> -->
+      <p>在线数: <span class="connected-peers-count">{{ activePeersCount }}</span></p>
       <p>传输速度: <span class="transfer-speed">{{ formatSpeed(currentSendSpeed) }}</span></p>
-      <p v-if="adaptiveInfo.enabled">动态速率控制:
+      <!-- <p v-if="adaptiveInfo.enabled">动态速率控制:
         <span class="adaptive-info">
           阻塞率: {{ (adaptiveInfo.congestionRate * 100).toFixed(1) }}% |
           动态块大小: {{ formatBytes(adaptiveInfo.currentChunkSize) }}
         </span>
-      </p>
+      </p> -->
     </div>
 
     <div class="file-transfer-section">
@@ -26,7 +26,7 @@
       </button>
       <div v-if="selectedFile" class="file-info">
         <p>已选文件: {{ selectedFile.name }} ({{ formatBytes(selectedFile.size) }})</p>
-        <p>基础分块大小: {{ formatBytes(BASE_CHUNK_SIZE) }}</p>
+        <!-- <p>基础分块大小: {{ formatBytes(BASE_CHUNK_SIZE) }}</p> -->
       </div>
       <div class="progress-container" v-if="selectedFile">
         <div class="progress-bar" :style="{ width: sendProgress + '%' }"></div>
