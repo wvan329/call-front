@@ -57,9 +57,7 @@ const incomingFileBuffers = {};
 const RTC_CONFIG = {
   iceServers: [
     {
-      urls: 'stun:59.110.35.198:3478',
-      username: "wgk",      // 匹配配置中的用户名
-      credential: "fun" // 匹配配置中的密码
+      urls: 'stun:stun.l.google.com:19302'
     }]
 };
 
