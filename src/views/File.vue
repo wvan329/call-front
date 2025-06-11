@@ -56,22 +56,14 @@ const incomingFileBuffers = {};
 // --- WebRTC Configuration ---
 const RTC_CONFIG = {
   iceServers: [
-    {
-      urls: 'stun:59.110.35.198:3478',
-      username: "wgk",      // 匹配配置中的用户名
-      credential: "fun" // 匹配配置中的密码
-    }]
+    { urls: 'stun:59.110.35.198:3478' }
+  ]
 };
 
 // --- File Transfer Constants ---
 const CHUNK_SIZE = 16 * 1024;
 
 const wsUrl = 'ws://59.110.35.198/wgk/ws/file'; // Your WebSocket signaling server URL
-
-const canBroadcastFile = computed(() => {
-  return Object.values(peerConnections).some(pcInfo => pcInfo.dc && pcInfo.dc.readyState === 'open');
-});
-
 // --- Utility Functions ---
 const formatBytes = (bytes, decimals = 2) => {
   if (bytes === 0) return '0 Bytes';
@@ -121,12 +113,6 @@ const connectWebSocket = () => {
   ws.value.onopen = () => {
     startHeartbeat();
     isWsConnected.value = true;
-    // Periodically send ping to keep connection alive
-    setInterval(() => {
-      if (ws.value && ws.value.readyState === WebSocket.OPEN) {
-        ws.value.send('ping');
-      }
-    }, 25000);
   };
 
   ws.value.onmessage = async (event) => {
