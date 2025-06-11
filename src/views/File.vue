@@ -538,11 +538,15 @@ const setupDataChannel = (dc, peerId) => {
     // peerConnections[peerId].dataChannel = null; // Mark as null directly
   };
 
-  dc.onerror = (error) => {
+dc.onerror = (error) => {
     console.error(`DataChannel error with ${peerId}:`, error);
-    // Optionally close PC on serious DC errors
+    // 尝试打印更详细的错误对象，看看它是否包含 `code` 或 `message`
+    console.error("DataChannel error object details:", JSON.stringify(error));
+    if (error.error) {
+        console.error("Specific RTCError:", error.error.name, error.error.message, error.error.code);
+    }
     closePeerConnection(peerId);
-  };
+};
 
   dc.onbufferedamountlow = () => {
     // console.log(`DataChannel buffered amount low for ${peerId}`);
