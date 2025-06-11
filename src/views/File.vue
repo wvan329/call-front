@@ -1,283 +1,444 @@
 <template>
-  <div style="padding: 16px; max-width: 600px; margin: auto;">
-    <h2>点对点文件传输</h2>
-    <p>连接状态: {{ isDataChannelOpen ? '已连接' : '未连接' }}</p>
-    <div>
-      <p>我的ID：<strong>{{ myId }}</strong></p>
-      <label>目标ID: <input v-model="targetId" placeholder="请输入对方ID" /></label>
-    </div>
-    <div style="margin-top: 10px;">
-      <input type="file" @change="onFileChange" />
+  <div class="file-transfer-container">
+    <h2>File Transfer</h2>
+
+    <div class="connection-status">
+      WebSocket Status:
+      <span :class="{'status-connected': isConnected, 'status-disconnected': !isConnected}">
+        {{ isConnected ? 'Connected' : 'Disconnected' }}
+      </span>
+      (ID: {{ currentSessionId }})
     </div>
 
-    <div v-if="receiveProgress >= 0" style="margin-top: 10px;">
-      <p>接收进度: {{ receiveProgress }}%</p>
+    <div class="file-input-section">
+      <input type="file" @change="handleFileChange" ref="fileInput" />
+      <button @click="sendFile" :disabled="!selectedFile || !isConnected">Send File</button>
+      <select v-model="selectedRecipientId" class="recipient-select">
+        <option value="">Broadcast (Send to all)</option>
+        <option v-for="sessionId in availableSessions" :key="sessionId" :value="sessionId">
+          {{ sessionId }}
+        </option>
+      </select>
+      <p v-if="selectedFile">Selected: {{ selectedFile.name }} ({{ formatBytes(selectedFile.size) }})</p>
+      <p v-if="sendFileError" class="error-message">{{ sendFileError }}</p>
     </div>
 
-    <div v-if="sendProgress >= 0" style="margin-top: 10px;">
-      <p>发送进度: {{ sendProgress }}%</p>
+    <div class="message-log">
+      <h3>Message Log</h3>
+      <div v-for="(log, index) in messageLogs" :key="index" :class="['log-item', log.type]">
+        <span class="log-timestamp">[{{ new Date(log.timestamp).toLocaleTimeString() }}]</span>
+        <span class="log-sender">From: {{ log.from || 'Me' }}</span>
+        <span v-if="log.to" class="log-recipient">To: {{ log.to }}</span>
+        <span class="log-content">{{ log.content }}</span>
+      </div>
+    </div>
+
+    <div class="received-files-section">
+      <h3>Received Files</h3>
+      <ul v-if="receivedFiles.length > 0">
+        <li v-for="(file, index) in receivedFiles" :key="index" class="received-file-item">
+          <p>
+            <span class="file-info">From: {{ file.from }} - {{ file.fileName }} ({{ formatBytes(file.fileSize) }})</span>
+            <a :href="file.url" :download="file.fileName" class="download-link">Download</a>
+          </p>
+        </li>
+      </ul>
+      <p v-else>No files received yet.</p>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue';
 
-const isDataChannelOpen = ref(false)
+const ws = ref(null);
+const isConnected = ref(false);
+const currentSessionId = ref('');
+const selectedFile = ref(null);
+const receivedFiles = ref([]);
+const messageLogs = ref([]);
+const sendFileError = ref('');
+const availableSessions = ref([]); // To store other connected session IDs for point-to-point
+const selectedRecipientId = ref(''); // For selecting a specific recipient
 
-const SIGNALING_SERVER = 'ws://59.110.35.198/wgk/ws' // 改成你的后端地址
+const wsUrl = 'ws://localhost:8080/ws'; // Adjust if your WebSocket endpoint is different
 
-const myId = ref('')
-const targetId = ref('')
+// Helper to format file size
+const formatBytes = (bytes, decimals = 2) => {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+};
 
-let localConnection = null
-let dataChannel = null
+// Log messages for debugging
+const addLog = (type, content, from = null, to = null) => {
+  messageLogs.value.push({
+    type,
+    content,
+    from,
+    to,
+    timestamp: Date.now(),
+  });
+};
 
-const sendProgress = ref(-1)
-const receiveProgress = ref(-1)
+const connectWebSocket = () => {
+  ws.value = new WebSocket(wsUrl);
 
-let websocket = null
-
-// 缓存文件数据
-let fileToSend = null
-let fileReader = null
-
-// 接收文件相关
-let receivedBuffers = []
-let receivedSize = 0
-let expectedFileSize = 0
-let expectedFileName = ''
-
-function setupWebSocket() {
-  websocket = new WebSocket(SIGNALING_SERVER)
-
-  websocket.onopen = () => {
-    console.log('WebSocket 已连接')
-  }
-
-  websocket.onmessage = async (event) => {
-    const message = JSON.parse(event.data)
-
-    // 服务端会给你一个 from 字段作为对方的sessionId
-    // 第一次连接，设置自己的ID
-    if (!myId.value && message.type === 'welcome') {
-      myId.value = message.from
-      return
-    }
-
-    if (message.type === 'user-left') {
-      alert(`用户离开了：${message.from}`)
-      cleanup()
-      return
-    }
-
-    if (message.from === myId.value) {
-      // 收到自己发的消息，忽略
-      return
-    }
-
-    switch (message.data?.type) {
-      case 'offer':
-        await handleOffer(message)
-        break
-      case 'answer':
-        await handleAnswer(message)
-        break
-      case 'iceCandidate':
-        await handleIceCandidate(message)
-        break
-      default:
-        break
-    }
-  }
-
-  websocket.onclose = () => {
-    console.log('WebSocket 已关闭')
-  }
-}
-
-async function sendSignal(data) {
-  if (!targetId.value) {
-    alert('请先输入目标ID')
-    return
-  }
-  // 发送格式，后端会加 from
-  const message = {
-    to: targetId.value,
-    data,
-  }
-  websocket.send(JSON.stringify(message))
-}
-
-// 创建连接时
-function createConnection() {
-  localConnection = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] })
-
-  dataChannel = localConnection.createDataChannel('fileTransfer')
-  dataChannel.binaryType = 'arraybuffer'
-
-  dataChannel.onopen = () => {
-    console.log('DataChannel 已打开，可以传文件了')
-    isDataChannelOpen.value = true
-  }
-
-  dataChannel.onclose = () => {
-    console.log('DataChannel 关闭')
-    isDataChannelOpen.value = false
-  }
-
-  // 其它事件保持不变...
-
-  localConnection.ondatachannel = (event) => {
-    dataChannel = event.channel
-    dataChannel.binaryType = 'arraybuffer'
-
-    dataChannel.onmessage = handleDataChannelMessage
-
-    dataChannel.onopen = () => {
-      console.log('对端 DataChannel 打开')
-      isDataChannelOpen.value = true
-    }
-    dataChannel.onclose = () => {
-      console.log('对端 DataChannel 关闭')
-      isDataChannelOpen.value = false
-    }
-  }
-}
-
-async function handleOffer(message) {
-  if (!localConnection) {
-    createConnection()
-  }
-
-  await localConnection.setRemoteDescription(new RTCSessionDescription(message.data))
-
-  const answer = await localConnection.createAnswer()
-  await localConnection.setLocalDescription(answer)
-
-  sendSignal(answer)
-}
-
-async function handleAnswer(message) {
-  await localConnection.setRemoteDescription(new RTCSessionDescription(message.data))
-}
-
-async function handleIceCandidate(message) {
-  if (message.data.candidate) {
-    try {
-      await localConnection.addIceCandidate(new RTCIceCandidate(message.data.candidate))
-    } catch (e) {
-      console.warn('添加ICE Candidate失败', e)
-    }
-  }
-}
-function onFileChange(event) {
-  const file = event.target.files[0]
-  if (!file) return
-
-  if (!isDataChannelOpen.value) {
-    alert('连接未就绪，无法发送文件')
-    return
-  }
-
-  fileToSend = file
-  sendFile(file)
-}
-
-function sendFile(file) {
-  const chunkSize = 16 * 1024
-  let offset = 0
-  sendProgress.value = 0
-
-  // 先发送文件信息，方便接收方准备
-  const fileInfo = JSON.stringify({ fileName: file.name, fileSize: file.size })
-  dataChannel.send(fileInfo)
-
-  fileReader = new FileReader()
-  fileReader.onload = (e) => {
-    if (!e.target) return
-    const buffer = e.target.result
-    dataChannel.send(buffer)
-    offset += buffer.byteLength
-    sendProgress.value = Math.floor((offset / file.size) * 100)
-    if (offset < file.size) {
-      readSlice(offset)
-    } else {
-      console.log('文件发送完毕')
-      sendProgress.value = 100
-    }
-  }
-
-  function readSlice(o) {
-    const slice = file.slice(o, o + chunkSize)
-    fileReader.readAsArrayBuffer(slice)
-  }
-
-  readSlice(0)
-}
-
-function handleDataChannelMessage(event) {
-  if (typeof event.data === 'string') {
-    // 解析文件信息 JSON
-    try {
-      const info = JSON.parse(event.data)
-      if (info.fileName && info.fileSize) {
-        expectedFileName = info.fileName
-        expectedFileSize = info.fileSize
-        receivedBuffers = []
-        receivedSize = 0
-        receiveProgress.value = 0
-        console.log('准备接收文件', info)
+  ws.value.onopen = () => {
+    isConnected.value = true;
+    addLog('system', 'WebSocket Connected.');
+    // Periodically send ping to keep connection alive
+    setInterval(() => {
+      if (ws.value && ws.value.readyState === WebSocket.OPEN) {
+        ws.value.send('ping');
+        // addLog('sent', 'ping'); // Uncomment for verbose ping logging
       }
-    } catch {
-      console.warn('收到非JSON文本消息')
+    }, 25000); // Send ping every 25 seconds
+  };
+
+  ws.value.onmessage = async (event) => {
+    const message = event.data;
+    // addLog('received', `Raw: ${message}`); // Log raw received messages for debugging
+
+    if (message === 'pong') {
+      // addLog('received', 'pong'); // Uncomment for verbose pong logging
+      return;
     }
-  } else {
-    // 接收二进制文件块
-    receivedBuffers.push(event.data)
-    receivedSize += event.data.byteLength
-    receiveProgress.value = Math.floor((receivedSize / expectedFileSize) * 100)
 
-    if (receivedSize >= expectedFileSize) {
-      // 文件接收完毕，组装下载
-      const blob = new Blob(receivedBuffers)
-      const a = document.createElement('a')
-      a.href = URL.createObjectURL(blob)
-      a.download = expectedFileName || 'file'
-      a.click()
-      URL.revokeObjectURL(a.href)
+    try {
+      const parsedMessage = JSON.parse(message);
+      const fromId = parsedMessage.from; // Sender's ID from backend
+      const type = parsedMessage.type;
 
-      receiveProgress.value = 100
-      console.log('文件接收完成')
+      // Update current session ID if this is the first message from the server
+      if (!currentSessionId.value && fromId) {
+        // This is a heuristic: the first message typically contains the session ID.
+        // A more robust way is for the server to explicitly send the session ID.
+        // For Spring's WebSocketSession, the ID is generated server-side.
+        // A simple way to get it is to have the server send a 'connection-info' message.
+        // For now, let's assume `parsedMessage.from` will eventually be our own ID
+        // if we broadcast a message and get it back, or it's implicitly known.
+        // For demonstration, we often don't have direct access to our own session ID
+        // from the client without server sending it explicitly.
+        // Let's set it to 'Me' for now and update later if we get it from a specific server message.
+        // If the server sends {"type": "session-id", "id": "ourId"}, we could capture it.
+        // For this example, we'll rely on the server broadcasting the 'user-left' or a new
+        // connection to imply other sessions, and not show our own ID unless we receive it.
+        // To properly get own ID, server needs to send it. For now, we'll display 'Me' for own actions.
+        // The server puts `from` field for *other* sessions, so 'Me' is fine for client's perspective.
+        // We can get the ID when `afterConnectionEstablished` happens on server and server sends it.
+      }
+
+
+      // --- Handle different message types ---
+      if (type === 'file') {
+        const { fileName, fileType, data, from } = parsedMessage;
+        addLog('received', `File: ${fileName} (${formatBytes(atob(data).length)})`, from);
+        // Decode Base64 to ArrayBuffer
+        const byteCharacters = atob(data);
+        const byteNumbers = new Array(byteCharacters.length);
+        for (let i = 0; i < byteCharacters.length; i++) {
+          byteNumbers[i] = byteCharacters.charCodeAt(i);
+        }
+        const byteArray = new Uint8Array(byteNumbers);
+        const blob = new Blob([byteArray], { type: fileType });
+        const url = URL.createObjectURL(blob);
+
+        receivedFiles.value.push({
+          fileName,
+          fileType,
+          fileSize: byteArray.length,
+          url,
+          from: from || 'Unknown', // 'from' should always be present from backend
+        });
+      } else if (type === 'user-left') {
+        // Update available sessions list
+        const leftUserId = parsedMessage.from;
+        availableSessions.value = availableSessions.value.filter(id => id !== leftUserId);
+        addLog('system', `User disconnected: ${leftUserId}`);
+      } else {
+        // This is a generic signaling message or other text message
+        addLog('received', `JSON: ${JSON.stringify(parsedMessage)}`, from, parsedMessage.to);
+
+        // For simplicity, let's assume any incoming message's 'from' is a potential peer
+        // Exclude our own session ID if we knew it, or if it's the 'from' field of our broadcast
+        if (fromId && fromId !== currentSessionId.value && !availableSessions.value.includes(fromId)) {
+            availableSessions.value.push(fromId);
+        }
+      }
+    } catch (e) {
+      // If it's not JSON, it might be a simple text message (like the initial "Connected: sessionId" from server)
+      addLog('received', `Text: ${message}`);
+      if (message.startsWith("Connected: ")) {
+          currentSessionId.value = message.substring("Connected: ".length);
+      }
     }
-  }
-}
+  };
 
-function cleanup() {
-  if (dataChannel) {
-    dataChannel.close()
-    dataChannel = null
+  ws.value.onclose = () => {
+    isConnected.value = false;
+    currentSessionId.value = '';
+    addLog('system', 'WebSocket Disconnected. Attempting to reconnect in 5 seconds...');
+    setTimeout(connectWebSocket, 5000); // Attempt to reconnect
+  };
+
+  ws.value.onerror = (error) => {
+    addLog('error', `WebSocket Error: ${error.message || error}`);
+    ws.value.close(); // Close to trigger onclose and reconnect
+  };
+};
+
+const handleFileChange = (event) => {
+  selectedFile.value = event.target.files[0];
+  sendFileError.value = ''; // Clear previous errors
+};
+
+const sendFile = async () => {
+  if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
+    sendFileError.value = 'WebSocket is not connected.';
+    return;
   }
-  if (localConnection) {
-    localConnection.close()
-    localConnection = null
+  if (!selectedFile.value) {
+    sendFileError.value = 'No file selected.';
+    return;
   }
-  sendProgress.value = -1
-  receiveProgress.value = -1
-  receivedBuffers = []
-  receivedSize = 0
-  expectedFileName = ''
-  expectedFileSize = 0
-}
+
+  const reader = new FileReader();
+
+  reader.onload = (e) => {
+    try {
+      const arrayBuffer = e.target.result;
+      const base64String = btoa(
+        new Uint8Array(arrayBuffer)
+          .reduce((data, byte) => data + String.fromCharCode(byte), '')
+      );
+
+      const messagePayload = {
+        type: 'file',
+        fileName: selectedFile.value.name,
+        fileType: selectedFile.value.type || 'application/octet-stream', // Fallback type
+        fileSize: selectedFile.value.size,
+        data: base64String,
+      };
+
+      if (selectedRecipientId.value) {
+        messagePayload.to = selectedRecipientId.value;
+        addLog('sent', `Sending file to ${selectedRecipientId.value}: ${selectedFile.value.name}`, 'Me', selectedRecipientId.value);
+      } else {
+        addLog('sent', `Broadcasting file: ${selectedFile.value.name}`, 'Me');
+      }
+
+      ws.value.send(JSON.stringify(messagePayload));
+      selectedFile.value = null; // Clear selected file after sending
+      if (currentSessionId.value === selectedRecipientId.value || !selectedRecipientId.value) {
+         // If broadcasting or sending to self, we'll receive our own message, so don't clear until then
+         // But for a true point-to-point where we don't receive our own send, clear it here.
+         // For simplicity, let's clear it regardless.
+      }
+      // Clear file input visually
+      if (document.querySelector('input[type="file"]')) {
+        document.querySelector('input[type="file"]').value = '';
+      }
+
+    } catch (error) {
+      console.error('Error sending file:', error);
+      sendFileError.value = 'Error processing file: ' + error.message;
+    }
+  };
+
+  reader.onerror = (error) => {
+    console.error('FileReader error:', error);
+    sendFileError.value = 'Error reading file: ' + error.message;
+  };
+
+  reader.readAsArrayBuffer(selectedFile.value);
+};
 
 onMounted(() => {
-  setupWebSocket()
-  createConnection()
-})
+  connectWebSocket();
+});
 
-onBeforeUnmount(() => {
-  cleanup()
-  if (websocket) websocket.close()
-})
-
+onUnmounted(() => {
+  if (ws.value) {
+    ws.value.close();
+  }
+});
 </script>
+
+<style scoped>
+.file-transfer-container {
+  font-family: Arial, sans-serif;
+  max-width: 800px;
+  margin: 20px auto;
+  padding: 20px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  background-color: #f9f9f9;
+}
+
+h2, h3 {
+  color: #333;
+  margin-bottom: 15px;
+  border-bottom: 1px solid #eee;
+  padding-bottom: 5px;
+}
+
+.connection-status {
+  margin-bottom: 20px;
+  padding: 10px;
+  background-color: #eef;
+  border-radius: 4px;
+  border: 1px solid #dde;
+}
+
+.status-connected {
+  color: green;
+  font-weight: bold;
+}
+
+.status-disconnected {
+  color: red;
+  font-weight: bold;
+}
+
+.file-input-section {
+  margin-bottom: 20px;
+  padding: 15px;
+  background-color: #fff;
+  border: 1px solid #eee;
+  border-radius: 4px;
+}
+
+.file-input-section input[type="file"] {
+  margin-right: 10px;
+  padding: 5px;
+}
+
+.file-input-section button {
+  padding: 8px 15px;
+  background-color: #007bff;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.3s ease;
+  margin-right: 10px;
+}
+
+.file-input-section button:disabled {
+  background-color: #cccccc;
+  cursor: not-allowed;
+}
+
+.file-input-section button:hover:enabled {
+  background-color: #0056b3;
+}
+
+.file-input-section p {
+  margin-top: 10px;
+  color: #555;
+}
+
+.recipient-select {
+  padding: 7px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  margin-left: 10px;
+  min-width: 150px;
+}
+
+.message-log {
+  margin-top: 20px;
+  background-color: #fff;
+  border: 1px solid #eee;
+  border-radius: 4px;
+  padding: 15px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.log-item {
+  padding: 5px 0;
+  border-bottom: 1px dotted #eee;
+  font-size: 0.9em;
+  color: #666;
+}
+
+.log-item:last-child {
+  border-bottom: none;
+}
+
+.log-timestamp {
+  color: #999;
+  margin-right: 5px;
+}
+
+.log-sender, .log-recipient {
+  font-weight: bold;
+  margin-right: 5px;
+}
+
+.log-item.system {
+  color: #0056b3;
+}
+.log-item.sent {
+  color: #28a745;
+}
+.log-item.received {
+  color: #ffc107;
+}
+.log-item.error {
+  color: #dc3545;
+  font-weight: bold;
+}
+
+.received-files-section {
+  margin-top: 20px;
+  background-color: #fff;
+  border: 1px solid #eee;
+  border-radius: 4px;
+  padding: 15px;
+}
+
+.received-files-section ul {
+  list-style: none;
+  padding: 0;
+}
+
+.received-file-item {
+  padding: 10px 0;
+  border-bottom: 1px dotted #eee;
+}
+
+.received-file-item:last-child {
+  border-bottom: none;
+}
+
+.file-info {
+  margin-right: 15px;
+  color: #333;
+}
+
+.download-link {
+  display: inline-block;
+  padding: 5px 10px;
+  background-color: #6c757d;
+  color: white;
+  text-decoration: none;
+  border-radius: 4px;
+  transition: background-color 0.3s ease;
+}
+
+.download-link:hover {
+  background-color: #5a6268;
+}
+
+.error-message {
+  color: red;
+  margin-top: 10px;
+}
+</style>
