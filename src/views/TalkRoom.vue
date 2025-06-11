@@ -66,13 +66,7 @@ let audioContext, analyser, microphone, javascriptNode;
 // --- WebRTC 配置 ---
 const pc_config = {
   iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun.flashdance.cx:3478' },
-    {
-      urls: 'turn:openrelay.metered.ca:80',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    }
+    { urls: 'stun:59.110.35.198:3478' },
   ]
 };
 
