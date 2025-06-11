@@ -182,39 +182,7 @@ const updateCongestionMetrics = (sendTime, wasBufferFull) => {
   }
 };
 
-const adjustTransferParameters = () => {
-  if (!adaptiveInfo.enabled) return;
 
-  const now = Date.now();
-  if (now - adaptiveInfo.lastAdjustmentTime < ADAPTIVE_ADJUSTMENT_INTERVAL) return;
-
-  const congestionRate = adaptiveInfo.congestionRate;
-
-  // Adjust chunk size based on congestion
-  if (congestionRate > 0.3) {
-    // High congestion - reduce chunk size
-    adaptiveInfo.currentChunkSize = Math.max(
-      MIN_CHUNK_SIZE,
-      Math.floor(adaptiveInfo.currentChunkSize * 0.8)
-    );
-    adaptiveInfo.currentBufferLimit = Math.max(
-      MIN_BUFFER_LIMIT,
-      Math.floor(adaptiveInfo.currentBufferLimit * 0.9)
-    );
-  } else if (congestionRate < 0.1) {
-    // Low congestion - increase chunk size gradually
-    adaptiveInfo.currentChunkSize = Math.min(
-      MAX_CHUNK_SIZE,
-      Math.floor(adaptiveInfo.currentChunkSize * 1.1)
-    );
-    adaptiveInfo.currentBufferLimit = Math.min(
-      MAX_BUFFER_LIMIT,
-      Math.floor(adaptiveInfo.currentBufferLimit * 1.05)
-    );
-  }
-
-  adaptiveInfo.lastAdjustmentTime = now;
-};
 
 // --- Enhanced File Transfer Logic ---
 const handleFileSelection = (event) => {
@@ -582,48 +550,6 @@ const stopAdaptiveControlTimer = () => {
   }
 };
 
-const startRetransmissionTimer = () => {
-  if (retransmissionTimer) return;
-  retransmissionTimer = setInterval(() => {
-    for (const fileId in outgoingTransfers) {
-      const transfer = outgoingTransfers[fileId];
-      if (transfer.isComplete) continue;
-
-      transfer.pendingAcks.forEach((item, chunkIndex) => {
-        if (Date.now() - item.timestamp > RETRANSMIT_TIMEOUT) {
-          if (item.retries < MAX_RETRANSMITS) {
-            // Find an active peer to retransmit
-            for (const peerId in transfer.peers) {
-              const peer = peerConnections[peerId];
-              const dc = peer?.dataChannel;
-              if (dc?.readyState === 'open' && !transfer.peers[peerId].isPeerComplete) {
-                const currentBufferLimit = adaptiveInfo.enabled ? adaptiveInfo.currentBufferLimit : INITIAL_BUFFER_LIMIT;
-                if (dc.bufferedAmount < currentBufferLimit) {
-                  try {
-                    dc.send(item.data);
-                    item.timestamp = Date.now();
-                    item.retries++;
-                    transferStats.retransmissions++;
-
-                    // Update packet loss rate
-                    transferStats.packetLossRate = transferStats.retransmissions / Math.max(transferStats.totalPacketsSent, 1);
-
-                    return; // Only retransmit once per timeout
-                  } catch (e) {
-                    console.error(`Error retransmitting chunk ${chunkIndex} to ${peerId}:`, e);
-                  }
-                }
-              }
-            }
-          } else {
-            console.error(`Max retransmits reached for chunk ${chunkIndex} of ${fileId}`);
-            transfer.pendingAcks.delete(chunkIndex);
-          }
-        }
-      });
-    }
-  }, 1000);
-};
 
 const stopRetransmissionTimer = () => {
   if (retransmissionTimer) {
@@ -638,9 +564,7 @@ const updateSendProgress = () => {
 
   if (timeDiffSeconds >= (UI_UPDATE_INTERVAL / 1000)) {
     const bytesDiff = totalBytesSent.value - lastBytesSentForSpeed.value;
-    if (timeDiffSeconds != 0) {
-      currentSendSpeed.value = bytesDiff / timeDiffSeconds;
-    }
+    currentSendSpeed.value = bytesDiff / timeDiffSeconds;
     lastBytesSentForSpeed.value = totalBytesSent.value;
     lastSpeedCalcTime.value = now;
   }
@@ -844,43 +768,6 @@ const createPeerConnection = (peerId) => {
   };
 };
 
-// 补充 setupDataChannel 函数
-const setupDataChannel = (dc, peerId) => {
-  const peer = peerConnections[peerId];
-  peer.dataChannel = dc;
-
-  dc.onopen = () => {
-    peer.status = 'connected';
-    console.log(`Data channel with ${peerId} opened`);
-  };
-
-  dc.onclose = () => {
-    peer.status = 'disconnected';
-    console.log(`Data channel with ${peerId} closed`);
-  };
-
-  dc.onerror = (error) => {
-    console.error(`Data channel error with ${peerId}:`, error);
-    closePeerConnection(peerId);
-  };
-
-  dc.onmessage = (event) => {
-    try {
-      // 处理文本消息（元数据和ACK）
-      if (typeof event.data === 'string') {
-        const msg = JSON.parse(event.data);
-        handleDataChannelMessage(msg, peerId);
-      }
-      // 处理二进制数据（文件块）
-      else {
-        handleFileChunk(event.data, peerId);
-      }
-    } catch (error) {
-      console.error('Error processing data channel message:', error);
-    }
-  };
-};
-
 // 补充 createOffer 函数
 const createOffer = async (peerId) => {
   const pc = peerConnections[peerId]?.connection;
@@ -978,119 +865,6 @@ const handleFileMetadata = (metadata, peerId) => {
   console.log(`Receiving file ${metadata.name} (${formatBytes(metadata.size)}) from ${peerId}`);
 };
 
-// 补充 handleFileChunk 函数
-const handleFileChunk = (data, peerId) => {
-  try {
-    const view = new DataView(data);
-    let offset = 0;
-
-    // 解析头部
-    const fileIdLength = view.getUint8(offset++);
-    const fileId = new TextDecoder().decode(
-      data.slice(offset, offset + fileIdLength)
-    );
-    offset += fileIdLength;
-
-    const chunkIndex = view.getUint32(offset, true);
-    offset += 4;
-
-    // 提取时间戳用于ACK
-    const timestamp = Number(view.getBigUint64(offset, true));
-    offset += 8;
-
-    // 提取块数据
-    const chunkData = data.slice(offset);
-
-    // 处理文件块
-    const fileInfo = incomingFiles[fileId];
-    if (!fileInfo) {
-      console.warn(`Received chunk for unknown file: ${fileId}`);
-      return;
-    }
-
-    // 避免重复接收
-    if (fileInfo.receivedChunks.has(chunkIndex)) {
-      return;
-    }
-
-    // 存储块
-    fileInfo.receivedChunks.set(chunkIndex, chunkData);
-    fileInfo.chunksReceived++;
-
-    // 更新进度
-    const progress = Math.floor((fileInfo.chunksReceived / fileInfo.chunksCount) * 100);
-    fileInfo.progress = progress;
-
-    // 更新UI
-    const receivedFile = receivedFiles.find(f => f.id === fileId);
-    if (receivedFile) {
-      receivedFile.progress = progress;
-    }
-
-    // 发送ACK
-    const dc = peerConnections[peerId]?.dataChannel;
-    if (dc?.readyState === 'open') {
-      dc.send(JSON.stringify({
-        type: 'chunk-ack',
-        fileId: fileId,
-        chunkIndex: chunkIndex,
-        timestamp: timestamp
-      }));
-    }
-
-    // 检查是否完成
-    if (fileInfo.chunksReceived === fileInfo.chunksCount) {
-      finalizeFile(fileId);
-    }
-  } catch (error) {
-    console.error('Error processing file chunk:', error);
-  }
-};
-
-// 补充 finalizeFile 函数
-const finalizeFile = (fileId) => {
-  const fileInfo = incomingFiles[fileId];
-  if (!fileInfo) return;
-
-  try {
-    // 按顺序组合块
-    const chunks = [];
-    for (let i = 0; i < fileInfo.chunksCount; i++) {
-      const chunk = fileInfo.receivedChunks.get(i);
-      if (!chunk) {
-        throw new Error(`Missing chunk ${i} for file ${fileInfo.name}`);
-      }
-      chunks.push(chunk);
-    }
-
-    // 创建Blob
-    const blob = new Blob(chunks, { type: fileInfo.type });
-
-    // 创建下载URL
-    const url = URL.createObjectURL(blob);
-
-    // 更新UI
-    const receivedFile = receivedFiles.find(f => f.id === fileId);
-    if (receivedFile) {
-      receivedFile.progress = 100;
-      receivedFile.url = url;
-      receivedFile.size = blob.size;
-    }
-
-    // 清理临时数据
-    delete incomingFiles[fileId];
-
-    console.log(`File ${fileInfo.name} received successfully in ${(Date.now() - fileInfo.startTime) / 1000} seconds`);
-  } catch (error) {
-    console.error(`Error finalizing file ${fileInfo.name}:`, error);
-
-    // 更新UI显示错误
-    const receivedFile = receivedFiles.find(f => f.id === fileId);
-    if (receivedFile) {
-      receivedFile.progress = -1; // 错误状态
-    }
-  }
-};
 
 // 补充 handleTransferComplete 函数
 const handleTransferComplete = (fileId, peerId) => {
@@ -1122,6 +896,381 @@ onUnmounted(() => {
   receivedFiles.forEach(file => {
     if (file.url) URL.revokeObjectURL(file.url);
   });
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+const handleFileChunk = (data, peerId) => {
+  try {
+    const view = new DataView(data);
+    let offset = 0;
+    
+    // 解析头部
+    const fileIdLength = view.getUint8(offset++);
+    const fileId = new TextDecoder().decode(
+      data.slice(offset, offset + fileIdLength)
+    );
+    offset += fileIdLength;
+    
+    const chunkIndex = view.getUint32(offset, true);
+    offset += 4;
+    
+    // 提取时间戳用于ACK
+    const timestamp = Number(view.getBigUint64(offset, true));
+    offset += 8;
+    
+    // 修复：直接使用原始数据切片，避免DataView截断问题
+    const chunkData = data.slice(offset);
+    
+    // 处理文件块
+    const fileInfo = incomingFiles[fileId];
+    if (!fileInfo) {
+      console.warn(`Received chunk for unknown file: ${fileId}`);
+      return;
+    }
+    
+    // 避免重复接收
+    if (fileInfo.receivedChunks.has(chunkIndex)) {
+      return;
+    }
+    
+    // 存储块 - 直接存储ArrayBuffer
+    fileInfo.receivedChunks.set(chunkIndex, chunkData);
+    fileInfo.chunksReceived++;
+    
+    // 更新进度
+    const progress = Math.floor((fileInfo.chunksReceived / fileInfo.chunksCount) * 100);
+    fileInfo.progress = progress;
+    
+    // 更新UI
+    const receivedFile = receivedFiles.find(f => f.id === fileId);
+    if (receivedFile) {
+      receivedFile.progress = progress;
+    }
+    
+    // 发送ACK
+    const dc = peerConnections[peerId]?.dataChannel;
+    if (dc?.readyState === 'open') {
+      dc.send(JSON.stringify({
+        type: 'chunk-ack',
+        fileId: fileId,
+        chunkIndex: chunkIndex,
+        timestamp: timestamp
+      }));
+    }
+    
+    // 检查是否完成
+    if (fileInfo.chunksReceived === fileInfo.chunksCount) {
+      finalizeFile(fileId);
+    }
+  } catch (error) {
+    console.error('Error processing file chunk:', error);
+  }
+};
+
+// 修复文件组装问题
+const finalizeFile = (fileId) => {
+  const fileInfo = incomingFiles[fileId];
+  if (!fileInfo) return;
+  
+  try {
+    // 按顺序组合块 - 修复：直接使用ArrayBuffer
+    const chunks = [];
+    let totalSize = 0;
+    
+    // 先计算总大小
+    for (let i = 0; i < fileInfo.chunksCount; i++) {
+      const chunk = fileInfo.receivedChunks.get(i);
+      if (!chunk) {
+        throw new Error(`Missing chunk ${i} for file ${fileInfo.name}`);
+      }
+      totalSize += chunk.byteLength;
+    }
+    
+    // 创建ArrayBuffer并填充数据
+    const buffer = new Uint8Array(totalSize);
+    let position = 0;
+    
+    for (let i = 0; i < fileInfo.chunksCount; i++) {
+      const chunk = fileInfo.receivedChunks.get(i);
+      buffer.set(new Uint8Array(chunk), position);
+      position += chunk.byteLength;
+    }
+    
+    // 创建Blob
+    const blob = new Blob([buffer], { type: fileInfo.type });
+    
+    // 创建下载URL
+    const url = URL.createObjectURL(blob);
+    
+    // 更新UI
+    const receivedFile = receivedFiles.find(f => f.id === fileId);
+    if (receivedFile) {
+      receivedFile.progress = 100;
+      receivedFile.url = url;
+      receivedFile.size = blob.size;
+    }
+    
+    // 清理临时数据
+    delete incomingFiles[fileId];
+    
+    console.log(`File ${fileInfo.name} received successfully in ${(Date.now() - fileInfo.startTime)/1000} seconds`);
+    console.log(`Original size: ${fileInfo.size}, Received size: ${blob.size}`);
+  } catch (error) {
+    console.error(`Error finalizing file ${fileInfo.name}:`, error);
+    
+    // 更新UI显示错误
+    const receivedFile = receivedFiles.find(f => f.id === fileId);
+    if (receivedFile) {
+      receivedFile.progress = -1; // 错误状态
+      receivedFile.error = `文件组装失败: ${error.message}`;
+    }
+  }
+};
+
+// --- 修复传输卡顿问题 ---
+
+// 增强连接状态监控
+const setupDataChannel = (dc, peerId) => {
+  const peer = peerConnections[peerId];
+  peer.dataChannel = dc;
+  
+  dc.onopen = () => {
+    peer.status = 'connected';
+    peer.lastActivity = Date.now();
+    console.log(`Data channel with ${peerId} opened`);
+  };
+  
+  dc.onclose = () => {
+    peer.status = 'disconnected';
+    console.log(`Data channel with ${peerId} closed`);
+    
+    // 重连机制
+    if (isTransferring.value) {
+      console.log(`Attempting to reconnect to ${peerId}...`);
+      setTimeout(() => {
+        if (peerConnections[peerId]?.status !== 'connected') {
+          createPeerConnection(peerId);
+          createOffer(peerId);
+        }
+      }, 3000);
+    }
+  };
+  
+  dc.onerror = (error) => {
+    console.error(`Data channel error with ${peerId}:`, error);
+    closePeerConnection(peerId);
+  };
+  
+  dc.onmessage = (event) => {
+    peer.lastActivity = Date.now(); // 更新最后活动时间
+    
+    try {
+      if (typeof event.data === 'string') {
+        const msg = JSON.parse(event.data);
+        handleDataChannelMessage(msg, peerId);
+      } else {
+        handleFileChunk(event.data, peerId);
+      }
+    } catch (error) {
+      console.error('Error processing data channel message:', error);
+    }
+  };
+};
+
+// 添加心跳检测
+const startConnectionMonitoring = () => {
+  setInterval(() => {
+    const now = Date.now();
+    Object.keys(peerConnections).forEach(peerId => {
+      const peer = peerConnections[peerId];
+      
+      // 检查数据通道活动
+      if (peer.status === 'connected' && 
+          peer.lastActivity && 
+          (now - peer.lastActivity) > 30000) {
+        console.warn(`No activity from ${peerId} for 30s, sending ping`);
+        
+        // 发送心跳包
+        try {
+          if (peer.dataChannel?.readyState === 'open') {
+            peer.dataChannel.send(JSON.stringify({ type: 'ping' }));
+          }
+        } catch (error) {
+          console.error(`Error sending ping to ${peerId}:`, error);
+        }
+      }
+      
+      // 检查超时
+      if (peer.status === 'connected' && 
+          peer.lastActivity && 
+          (now - peer.lastActivity) > 60000) {
+        console.warn(`Connection to ${peerId} timed out, closing`);
+        closePeerConnection(peerId);
+      }
+    });
+  }, 10000);
+};
+
+// 修改自适应算法，避免过度降速
+const adjustTransferParameters = () => {
+  if (!adaptiveInfo.enabled) return;
+
+  const now = Date.now();
+  if (now - adaptiveInfo.lastAdjustmentTime < ADAPTIVE_ADJUSTMENT_INTERVAL) return;
+
+  const congestionRate = adaptiveInfo.congestionRate;
+  
+  // 更保守的调整策略
+  if (congestionRate > 0.4) {
+    // 高拥塞 - 适度减少块大小
+    adaptiveInfo.currentChunkSize = Math.max(
+      MIN_CHUNK_SIZE,
+      Math.floor(adaptiveInfo.currentChunkSize * 0.9) // 仅减少10%
+    );
+    adaptiveInfo.currentBufferLimit = Math.max(
+      MIN_BUFFER_LIMIT,
+      Math.floor(adaptiveInfo.currentBufferLimit * 0.95) // 仅减少5%
+    );
+  } else if (congestionRate < 0.1 && activePeersCount.value > 0) {
+    // 低拥塞 - 谨慎增加
+    adaptiveInfo.currentChunkSize = Math.min(
+      MAX_CHUNK_SIZE,
+      Math.floor(adaptiveInfo.currentChunkSize * 1.05) // 仅增加5%
+    );
+    adaptiveInfo.currentBufferLimit = Math.min(
+      MAX_BUFFER_LIMIT,
+      Math.floor(adaptiveInfo.currentBufferLimit * 1.03) // 仅增加3%
+    );
+  }
+
+  console.log(`Adaptive adjustment: 
+    ChunkSize: ${formatBytes(adaptiveInfo.currentChunkSize)}, 
+    BufferLimit: ${formatBytes(adaptiveInfo.currentBufferLimit)},
+    Congestion: ${(congestionRate * 100).toFixed(1)}%`);
+
+  adaptiveInfo.lastAdjustmentTime = now;
+};
+
+// 增强重传机制
+const startRetransmissionTimer = () => {
+  if (retransmissionTimer) return;
+  retransmissionTimer = setInterval(() => {
+    const now = Date.now();
+    for (const fileId in outgoingTransfers) {
+      const transfer = outgoingTransfers[fileId];
+      if (transfer.isComplete) continue;
+
+      transfer.pendingAcks.forEach((item, chunkIndex) => {
+        // 跳过最近发送的块
+        if (now - item.timestamp < RETRANSMIT_TIMEOUT) return;
+        
+        if (item.retries < MAX_RETRANSMITS) {
+          let sent = false;
+          
+          // 尝试所有活跃对等端
+          for (const peerId in transfer.peers) {
+            const peer = peerConnections[peerId];
+            if (!peer || peer.status !== 'connected') continue;
+            
+            const dc = peer.dataChannel;
+            if (dc?.readyState === 'open' && !transfer.peers[peerId].isPeerComplete) {
+              const currentBufferLimit = adaptiveInfo.enabled ? 
+                adaptiveInfo.currentBufferLimit : 
+                INITIAL_BUFFER_LIMIT;
+              
+              // 检查缓冲区状态
+              if (dc.bufferedAmount < currentBufferLimit * 0.8) {
+                try {
+                  dc.send(item.data);
+                  item.timestamp = now;
+                  item.retries++;
+                  transferStats.retransmissions++;
+                  sent = true;
+                  
+                  // 更新丢包率
+                  transferStats.packetLossRate = 
+                    transferStats.retransmissions / 
+                    Math.max(transferStats.totalPacketsSent, 1);
+                  
+                  break; // 发送成功后跳出循环
+                } catch (e) {
+                  console.error(`Error retransmitting chunk ${chunkIndex} to ${peerId}:`, e);
+                }
+              }
+            }
+          }
+          
+          // 如果所有对等端都失败，增加重试计数
+          if (!sent) {
+            item.retries++;
+          }
+        } else {
+          console.error(`Max retransmits reached for chunk ${chunkIndex} of ${fileId}`);
+          transfer.pendingAcks.delete(chunkIndex);
+          
+          // 标记为失败但继续传输
+          transfer.ackedChunks.add(chunkIndex);
+        }
+      });
+    }
+  }, 1000);
+};
+
+// 添加块超时处理
+const checkChunkTimeouts = () => {
+  setInterval(() => {
+    const now = Date.now();
+    for (const fileId in outgoingTransfers) {
+      const transfer = outgoingTransfers[fileId];
+      if (transfer.isComplete) continue;
+      
+      transfer.pendingAcks.forEach((item, chunkIndex) => {
+        if (now - item.timestamp > RETRANSMIT_TIMEOUT * 3) {
+          console.warn(`Chunk ${chunkIndex} timeout, skipping`);
+          transfer.pendingAcks.delete(chunkIndex);
+          transfer.ackedChunks.add(chunkIndex);
+        }
+      });
+    }
+  }, 5000);
+};
+
+// --- 在生命周期钩子中启动监控 ---
+onMounted(() => {
+  connectWebSocket();
+  startRetransmissionTimer();
+  startConnectionMonitoring();
+  checkChunkTimeouts();
 });
 </script>
 
