@@ -6,7 +6,6 @@ const ICE_SERVERS = [{ urls: 'stun:59.110.35.198:3478' }]
 
 const ws = ref(null)
 const peers = ref({})
-const selfId = ref('')
 const onlineUsers = ref([])
 const file = ref(null)
 const receivedFiles = ref([])  // 每项：{ name, url, size }
@@ -137,9 +136,7 @@ async function sendFile() {
       desc: pc.localDescription
     }))
 
-    const reader = file.value.stream().getReader()
     const MAX_BUFFER = 16 * 1024 * 1024
-    let sentSize = 0
     dc.onopen = async () => {
       // 先发元信息
       dc.send(JSON.stringify({ type: 'meta', filename: file.value.name, size: fileSize }))
@@ -176,13 +173,12 @@ async function sendFile() {
   }
 }
 
-</script>
+</script>  
 
 <template>
   <div>
-    <p>在线用户：{{ onlineUsers }}</p>
 
-    <input type="file" @change="e => file.value = e.target.files[0]" />
+    <input type="file" @change="handleFileChange" />
     <button @click="sendFile">发送文件</button>
 
     <p>发送进度：{{ sendProgress }}%</p>
