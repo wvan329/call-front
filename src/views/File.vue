@@ -157,69 +157,76 @@ const connectWebSocket = () => {
     }, 25000); // Send ping every 25 seconds
   };
 
-  ws.value.onmessage = async (event) => {
-    const message = event.data;
+ws.value.onmessage = async (event) => {
+  const message = event.data;
 
-    if (message === 'pong') {
-      return; // Ignore pong messages
+  if (message === 'pong') {
+    return;
+  }
+
+  try {
+    const parsedMessage = JSON.parse(message);
+    const fromId = parsedMessage.from; // 这行在这里可能会导致问题，因为它会尝试访问不存在的'from'
+
+    // --- 正确处理自己的 session ID ---
+    if (parsedMessage.type === 'session-id' && parsedMessage.id) {
+        mySessionId.value = parsedMessage.id;
+        addLog('system', `My session ID is: ${mySessionId.value}`);
+        return; // 处理完后直接返回，不再向下执行，避免尝试访问 'from'
     }
 
-    try {
-      const parsedMessage = JSON.parse(message);
-      const fromId = parsedMessage.from;
-
-      // Update our own session ID if the server sends it (e.g., "Connected: sessionId")
-      // This is a simple heuristic; ideally, the server explicitly sends "my-id"
-      if (!mySessionId.value && message.startsWith("Connected: ")) {
-          mySessionId.value = message.substring("Connected: ".length);
-          addLog('system', `My session ID is: ${mySessionId.value}`);
-      } else if (parsedMessage.type === 'session-id' && parsedMessage.id) {
-          mySessionId.value = parsedMessage.id;
-          addLog('system', `My session ID is: ${mySessionId.value}`);
-      }
-
-
-      // --- Update available peers list ---
-      // Filter out our own ID and duplicates
-      const newPeers = new Set(availablePeers.value);
-      if (fromId && fromId !== mySessionId.value) {
-          newPeers.add(fromId);
-      }
-      // If a user-left message comes, remove them
-      if (parsedMessage.type === 'user-left') {
-          newPeers.delete(parsedMessage.from);
-          addLog('system', `Peer disconnected: ${parsedMessage.from}`);
-          // If the disconnected peer was our selected peer, clear selection
-          if (selectedPeerId.value === parsedMessage.from) {
-              selectedPeerId.value = '';
-              closePeerConnection(); // Close our RTCPeerConnection if peer disconnected
-          }
-      }
-      availablePeers.value = Array.from(newPeers);
-
-
-      // --- Handle WebRTC Signaling Messages ---
-      if (parsedMessage.type === 'offer') {
-        addLog('received', `Received WebRTC Offer from ${fromId}`, from);
-        await handleOffer(parsedMessage.sdp, fromId);
-      } else if (parsedMessage.type === 'answer') {
-        addLog('received', `Received WebRTC Answer from ${fromId}`, from);
-        await handleAnswer(parsedMessage.sdp);
-      } else if (parsedMessage.type === 'candidate') {
-        addLog('received', `Received ICE Candidate from ${fromId}`, from);
-        await handleCandidate(parsedMessage.candidate);
-      } else if (parsedMessage.type === 'file-metadata-signal') {
-          // This is a signaling message for file metadata, handled by the data channel logic
-          // No direct action here, it's just forwarded via signaling
-          addLog('received', `File metadata signaling message from ${fromId}`, from);
-      } else {
-        // Generic messages (like initial 'Connected: xxx')
-        addLog('received', `Signaling: ${JSON.stringify(parsedMessage)}`, from, parsedMessage.to);
-      }
-    } catch (e) {
-      addLog('error', `Error parsing message or unknown text: ${message}. Error: ${e.message}`);
+    // --- 处理用户列表更新 ---
+    if (parsedMessage.type === 'user-list' && parsedMessage.users) {
+        // 更新可用 peer 列表，排除自己
+        const newPeers = parsedMessage.users.filter(id => id !== mySessionId.value);
+        // 使用 Set 来去重并保持当前选中的 peer 不变
+        const currentSelected = selectedPeerId.value;
+        availablePeers.value = Array.from(new Set([...newPeers, currentSelected])).filter(Boolean); // 过滤掉空值
+        addLog('system', `Updated user list. Online peers: ${newPeers.join(', ')}`);
+        return; // 处理完后直接返回
     }
-  };
+
+    // --- Update available peers list (针对其他信令消息，如 offer/answer/candidate) ---
+    // 只有当消息有from字段时才处理 peer 列表更新
+    if (fromId && fromId !== mySessionId.value) {
+        const newPeers = new Set(availablePeers.value);
+        newPeers.add(fromId);
+        // 如果 fromId 是 'user-left' 消息，则在下面处理
+        if (parsedMessage.type === 'user-left') {
+            newPeers.delete(fromId);
+            addLog('system', `Peer disconnected: ${fromId}`);
+            if (selectedPeerId.value === fromId) {
+                selectedPeerId.value = '';
+                closePeerConnection();
+            }
+        }
+        availablePeers.value = Array.from(newPeers);
+    }
+
+
+    // --- Handle WebRTC Signaling Messages ---
+    if (parsedMessage.type === 'offer') {
+      addLog('received', `Received WebRTC Offer from ${fromId}`, fromId); // 确保 fromId 有效
+      await handleOffer(parsedMessage.sdp, fromId);
+    } else if (parsedMessage.type === 'answer') {
+      addLog('received', `Received WebRTC Answer from ${fromId}`, fromId);
+      await handleAnswer(parsedMessage.sdp);
+    } else if (parsedMessage.type === 'candidate') {
+      addLog('received', `Received ICE Candidate from ${fromId}`, fromId);
+      await handleCandidate(parsedMessage.candidate);
+    } else if (parsedMessage.type === 'file-metadata-signal' || parsedMessage.type === 'file-transfer-complete-signal') {
+        // 这些消息从 data channel 收到，不应该从 signaling WS 收到
+        // 如果是调试中误发，可以记录日志但不需要特殊处理
+        addLog('warn', `Unexpected file transfer signal on main WS from ${fromId}: ${parsedMessage.type}`);
+    } else {
+      // 通用信令消息（如旧的语音信令，如果还在用）
+      addLog('received', `Signaling: ${JSON.stringify(parsedMessage)}`, fromId, parsedMessage.to);
+    }
+  } catch (e) {
+    // 如果不是有效的 JSON，或者其他处理错误，记录下来
+    addLog('error', `Error processing WS message: ${message}. Error: ${e.message}`);
+  }
+};
 
   ws.value.onclose = () => {
     isWsConnected.value = false;
