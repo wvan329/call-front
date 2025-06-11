@@ -2,13 +2,14 @@
   <div class="webrtc-file-transfer-container">
     <h2>WebRTC File Broadcast</h2>
 
-    <div class="connection-status">
-      WebSocket Signaling Status:
-      <span :class="{'status-connected': isWsConnected, 'status-disconnected': !isWsConnected}">
-        {{ isWsConnected ? 'Connected' : 'Disconnected' }}
-      </span>
-      (My ID: {{ mySessionId || 'Connecting...' }})
-      <p>Online Peers: {{ Object.keys(peerConnections).length }}</p>
+    <div class="connection-info">
+      <p>My ID: <span class="my-id">{{ mySessionId || 'Connecting...' }}</span></p>
+      <p>Connected Peers: <span class="connected-peers-count">{{ Object.keys(peerConnections).length }}</span></p>
+      <p>Signaling Server:
+        <span :class="{'status-connected': isWsConnected, 'status-disconnected': !isWsConnected}">
+          {{ isWsConnected ? 'Connected' : 'Disconnected' }}
+        </span>
+      </p>
     </div>
 
     <div class="file-transfer-section">
@@ -23,16 +24,6 @@
         <span>{{ sendFileProgress.toFixed(1) }}%</span>
       </div>
       <p v-if="fileTransferError" class="error-message">{{ fileTransferError }}</p>
-    </div>
-
-    <div class="message-log">
-      <h3>Signaling Log</h3>
-      <div v-for="(log, index) in messageLogs" :key="index" :class="['log-item', log.type]">
-        <span class="log-timestamp">[{{ new Date(log.timestamp).toLocaleTimeString() }}]</span>
-        <span class="log-sender">From: {{ log.from || 'System' }}</span>
-        <span v-if="log.to" class="log-recipient">To: {{ log.to }}</span>
-        <span class="log-content">{{ log.content }}</span>
-      </div>
     </div>
 
     <div class="received-files-section">
@@ -51,6 +42,16 @@
       </ul>
       <p v-else>No files received yet.</p>
     </div>
+
+    <div class="message-log">
+      <h3>Event Log (for debugging)</h3>
+      <div v-for="(log, index) in messageLogs" :key="index" :class="['log-item', log.type]">
+        <span class="log-timestamp">[{{ new Date(log.timestamp).toLocaleTimeString() }}]</span>
+        <span v-if="log.from" class="log-sender">From: {{ log.from }}</span>
+        <span v-if="log.to" class="log-recipient">To: {{ log.to }}</span>
+        <span class="log-content">{{ log.content }}</span>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -59,7 +60,7 @@ import { ref, onMounted, onUnmounted, reactive, computed } from 'vue';
 
 const ws = ref(null);
 const isWsConnected = ref(false);
-const mySessionId = ref(''); // Our own session ID from the server
+const mySessionId = ref('');
 
 // Store multiple peer connections and their associated data channels
 const peerConnections = reactive({}); // { peerId: { pc: RTCPeerConnection, dc: RTCDataChannel } }
@@ -69,7 +70,7 @@ const sendFileProgress = ref(0);
 const fileTransferError = ref('');
 
 const messageLogs = ref([]);
-const receivedFiles = reactive([]); // Use reactive for array of objects
+const receivedFiles = reactive([]);
 
 // Temporary storage for incoming file chunks for *each file*
 const incomingFileBuffers = {}; // { fileId: { metadata: {}, chunks: [], receivedSize: 0, from: '', progress: 0, index: N } }
@@ -77,12 +78,12 @@ const incomingFileBuffers = {}; // { fileId: { metadata: {}, chunks: [], receive
 // --- WebRTC Configuration ---
 const RTC_CONFIG = {
   iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' }, // Google's public STUN server
+    { urls: 'stun:stun.l.google.com:19302' },
   ]
 };
 
 // --- File Transfer Constants ---
-const CHUNK_SIZE = 16 * 1024; // 16KB, a common safe chunk size for WebRTC DataChannel
+const CHUNK_SIZE = 16 * 1024;
 
 const wsUrl = 'ws://59.110.35.198/wgk/ws'; // Your WebSocket signaling server URL
 
@@ -102,6 +103,14 @@ const formatBytes = (bytes, decimals = 2) => {
 };
 
 const addLog = (type, content, from = null, to = null) => {
+  // Filter out excessive ICE candidate logs unless debugging
+  if (type === 'system' && (content.includes('Sending ICE Candidate') || content.includes('Received ICE Candidate'))) {
+    // return; // Uncomment to hide ICE candidate logs
+  }
+  if (type === 'received' && content.includes('Received chunk')) {
+    // return; // Uncomment to hide received chunk logs
+  }
+
   messageLogs.value.push({
     type,
     content,
@@ -138,29 +147,34 @@ const connectWebSocket = () => {
     try {
       const parsedMessage = JSON.parse(message);
 
-      // Handle system messages first
+      // Handle system messages first (from server, no 'from' field)
       if (parsedMessage.type === 'session-id' && parsedMessage.id) {
         mySessionId.value = parsedMessage.id;
         addLog('system', `My session ID is: ${mySessionId.value}`);
-        return;
+        return; // Handled, return
       }
 
       if (parsedMessage.type === 'user-list' && parsedMessage.users) {
-        // Find new users we are not yet connected to
-        const currentPeerIds = Object.keys(peerConnections);
         const onlinePeers = parsedMessage.users.filter(id => id !== mySessionId.value);
+        const currentConnectedPeers = Object.keys(peerConnections);
 
-        // Initiate connection to new peers
+        // Initiate connection to new peers based on Session ID comparison
         onlinePeers.forEach(peerId => {
-          if (!currentPeerIds.includes(peerId) && !peerConnections[peerId]) {
-            addLog('system', `New peer detected: ${peerId}. Initiating WebRTC connection.`);
-            createOffer(peerId); // Automatically create offer for new peers
+          if (!currentConnectedPeers.includes(peerId) && !peerConnections[peerId]) {
+            // Only create offer if mySessionId is lexicographically smaller than peerId
+            // This prevents simultaneous offers (glare)
+            if (mySessionId.value < peerId) {
+                addLog('system', `New peer detected (${peerId}). My ID is smaller, creating offer.`);
+                createOffer(peerId);
+            } else {
+                addLog('system', `New peer detected (${peerId}). My ID is larger, waiting for offer.`);
+            }
           }
         });
 
-        // Remove connections to peers who have left
-        currentPeerIds.forEach(peerId => {
-          if (!onlinePeers.includes(peerId) && peerConnections[peerId]) {
+        // Close connections to peers who have left
+        currentConnectedPeers.forEach(peerId => {
+          if (!onlinePeers.includes(peerId)) {
             addLog('system', `Peer ${peerId} is no longer in user list. Closing connection.`);
             closePeerConnection(peerId);
           }
@@ -185,11 +199,12 @@ const connectWebSocket = () => {
       } else if (parsedMessage.type === 'candidate') {
         addLog('received', `Received ICE Candidate from ${fromId}`, fromId);
         await handleCandidate(parsedMessage.candidate, fromId);
-      } else if (parsedMessage.type === 'user-left') { // Also handle user-left to clean up specific peerConnections
+      } else if (parsedMessage.type === 'user-left') {
         addLog('system', `Peer disconnected: ${fromId}`);
         closePeerConnection(fromId);
       } else {
-        addLog('received', `Signaling: ${JSON.stringify(parsedMessage)}`, fromId, parsedMessage.to);
+        // Fallback for any other unexpected messages from peers
+        addLog('received', `Unexpected signaling from ${fromId}: ${JSON.stringify(parsedMessage)}`, fromId, parsedMessage.to);
       }
     } catch (e) {
       addLog('error', `Error processing WS message: ${message}. Error: ${e.message}`);
@@ -199,7 +214,6 @@ const connectWebSocket = () => {
   ws.value.onclose = () => {
     isWsConnected.value = false;
     addLog('system', 'WebSocket Signaling Disconnected. Attempting to reconnect in 5 seconds...');
-    // Clear all peer connections when WS disconnects
     Object.keys(peerConnections).forEach(peerId => closePeerConnection(peerId));
     setTimeout(connectWebSocket, 5000);
   };
@@ -212,8 +226,13 @@ const connectWebSocket = () => {
 
 // --- WebRTC Peer Connection Logic ---
 const createPeerConnection = (targetPeerId, isOfferer = true) => {
-  if (peerConnections[targetPeerId]) {
-    addLog('system', `Peer connection already exists for ${targetPeerId}. Reusing.`);
+  // If a connection already exists, and it's active, reuse it.
+  // If it's closed/failed, we recreate it.
+  if (peerConnections[targetPeerId] && peerConnections[targetPeerId].pc &&
+      peerConnections[targetPeerId].pc.connectionState !== 'closed' &&
+      peerConnections[targetPeerId].pc.iceConnectionState !== 'failed' &&
+      peerConnections[targetPeerId].pc.iceConnectionState !== 'disconnected') {
+    addLog('system', `Peer connection to ${targetPeerId} already exists and is active. Reusing.`);
     return peerConnections[targetPeerId].pc;
   }
 
@@ -223,7 +242,7 @@ const createPeerConnection = (targetPeerId, isOfferer = true) => {
 
   pc.onicecandidate = (event) => {
     if (event.candidate) {
-      addLog('system', `Sending ICE Candidate to ${targetPeerId}`);
+      addLog('system', `[${targetPeerId}] Sending ICE Candidate`);
       ws.value.send(JSON.stringify({
         type: 'candidate',
         candidate: event.candidate,
@@ -234,11 +253,20 @@ const createPeerConnection = (targetPeerId, isOfferer = true) => {
 
   pc.oniceconnectionstatechange = () => {
     addLog('system', `[${targetPeerId}] ICE Connection State: ${pc.iceConnectionState}`);
-    if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'closed') {
-      addLog('error', `[${targetPeerId}] ICE Connection Failed/Disconnected/Closed. Closing peer connection.`);
+    if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+      addLog('error', `[${targetPeerId}] ICE Connection Failed/Disconnected. Closing peer connection.`);
       closePeerConnection(targetPeerId); // Clean up
     }
   };
+
+  pc.onconnectionstatechange = () => {
+      addLog('system', `[${targetPeerId}] RTCPeerConnection State: ${pc.connectionState}`);
+      if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+          addLog('error', `[${targetPeerId}] PeerConnection state changed to ${pc.connectionState}. Closing.`);
+          closePeerConnection(targetPeerId);
+      }
+  };
+
 
   pc.ondatachannel = (event) => {
     addLog('system', `[${targetPeerId}] Received DataChannel from peer: ${event.channel.label}`);
@@ -247,7 +275,6 @@ const createPeerConnection = (targetPeerId, isOfferer = true) => {
   };
 
   if (isOfferer) {
-    // Only the offerer creates the data channel explicitly
     const dc = pc.createDataChannel("file-transfer-channel", {
       ordered: true,
       maxRetransmits: 0
@@ -262,21 +289,18 @@ const createPeerConnection = (targetPeerId, isOfferer = true) => {
 const setupDataChannelListeners = (channel, peerId) => {
   channel.onopen = () => {
     addLog('system', `[${peerId}] DataChannel opened: ${channel.label}`);
-    // Clear any previous error messages related to DC state
-    fileTransferError.value = '';
+    fileTransferError.value = ''; // Clear any previous error messages related to DC state
   };
 
   channel.onclose = () => {
     addLog('system', `[${peerId}] DataChannel closed: ${channel.label}`);
     if (peerConnections[peerId]) {
-        peerConnections[peerId].dc = null; // Clear DC reference
+        peerConnections[peerId].dc = null;
     }
-    // sendFileProgress.value = 0; // Don't reset global progress here
   };
 
   channel.onerror = (error) => {
     addLog('error', `[${peerId}] DataChannel Error: ${error.message || error}`);
-    // fileTransferError.value = `Data channel error with ${peerId}: ${error.message || 'Unknown error'}`; // Too verbose for each DC
   };
 
   channel.onmessage = async (event) => {
@@ -287,21 +311,19 @@ const setupDataChannelListeners = (channel, peerId) => {
         const parsedData = JSON.parse(receivedData);
         if (parsedData.type === 'file-metadata-signal') {
           const { fileId, fileName, fileType, fileSize, from } = parsedData;
-          addLog('received', `Received file metadata for ${fileName} (ID: ${fileId}) from ${from}`);
+          addLog('received', `[${from}] Received file metadata for ${fileName}`);
           incomingFileBuffers[fileId] = {
             metadata: { fileName, fileType, fileSize },
             chunks: [],
             receivedSize: 0,
             from: from,
             progress: 0,
-            // Assign a unique index for reactive array updates
-            index: receivedFiles.length,
+            index: receivedFiles.length, // Assign unique index for reactive array updates
           };
-          // Add a placeholder to receivedFiles immediately for UI update
-          receivedFiles.push(incomingFileBuffers[fileId]);
+          receivedFiles.push(incomingFileBuffers[fileId]); // Add a placeholder to receivedFiles immediately
         } else if (parsedData.type === 'file-transfer-complete-signal') {
           const { fileId, fileName, from } = parsedData;
-          addLog('received', `File transfer complete signal for ${fileName} (ID: ${fileId}) from ${from}`);
+          addLog('received', `[${from}] File transfer complete signal for ${fileName}`);
         } else {
           addLog('received', `[${peerId}] DataChannel String: ${receivedData}`);
         }
@@ -314,7 +336,7 @@ const setupDataChannelListeners = (channel, peerId) => {
         const chunkData = receivedData.slice(1 + fileIdLen + 4 + 1);
 
         if (!incomingFileBuffers[fileId]) {
-          addLog('error', `Received file chunk for unknown file ID: ${fileId}. Metadata might be missing.`);
+          addLog('error', `Received chunk for unknown file ID: ${fileId}. Metadata might be missing.`);
           return;
         }
 
@@ -323,14 +345,13 @@ const setupDataChannelListeners = (channel, peerId) => {
         fileBuffer.receivedSize += chunkData.byteLength;
         fileBuffer.progress = (fileBuffer.receivedSize / fileBuffer.metadata.fileSize) * 100;
 
-        // Update the reactive receivedFiles array for progress display
         const reactiveFileItem = receivedFiles.find(item => item.index === fileBuffer.index);
         if (reactiveFileItem) {
             reactiveFileItem.progress = fileBuffer.progress;
         }
 
         if (isLastChunk) {
-          addLog('received', `Last chunk received for ${fileBuffer.metadata.fileName} (ID: ${fileId}). Reassembling...`);
+          addLog('received', `[${fileBuffer.from}] Last chunk received for ${fileBuffer.metadata.fileName}. Reassembling...`);
           const fullBuffer = concatenateArrayBuffers(fileBuffer.chunks);
           const blob = new Blob([fullBuffer], { type: fileBuffer.metadata.fileType });
           const url = URL.createObjectURL(blob);
@@ -341,7 +362,7 @@ const setupDataChannelListeners = (channel, peerId) => {
           }
 
           delete incomingFileBuffers[fileId];
-          addLog('system', `File reassembled and ready for download: ${fileBuffer.metadata.fileName}`);
+          addLog('system', `[${fileBuffer.from}] File reassembled and ready for download: ${fileBuffer.metadata.fileName}`);
         }
       }
     } catch (e) {
@@ -399,10 +420,21 @@ const sendSignalingMessage = (type, payload, toId) => {
 };
 
 const createOffer = async (targetPeerId) => {
+  // If we already have an active PC for this peer, don't create another offer
+  if (peerConnections[targetPeerId] && peerConnections[targetPeerId].pc &&
+      peerConnections[targetPeerId].pc.connectionState !== 'closed' &&
+      peerConnections[targetPeerId].pc.iceConnectionState !== 'failed') {
+      // If it's already in have-local-offer state, means we already sent an offer
+      if (peerConnections[targetPeerId].pc.localDescription && peerConnections[targetPeerId].pc.localDescription.type === 'offer') {
+          addLog('warn', `[${targetPeerId}] Already in have-local-offer state, not creating new offer.`);
+          return;
+      }
+  }
+
   const pc = createPeerConnection(targetPeerId, true); // True means this client is the offerer
   try {
     const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
+    await pc.setLocalDescription(offer); // Set local description before sending
     sendSignalingMessage('offer', { sdp: offer }, targetPeerId);
     addLog('sent', `Sent WebRTC Offer to ${targetPeerId}`);
   } catch (error) {
@@ -413,9 +445,23 @@ const createOffer = async (targetPeerId) => {
 const handleOffer = async (sdp, fromId) => {
   const pc = createPeerConnection(fromId, false); // False means this client is the answerer
   try {
+    // Handle glare: if we've already created an offer, compare.
+    // For simplicity here, if current state is have-local-offer, we might ignore or re-evaluate.
+    // A more robust glare handling might involve comparing SDPs or waiting for connection state.
+    // For now, if we have an existing offer that's not stable, we proceed.
+    if (pc.signalingState === 'have-local-offer') {
+        addLog('warn', `[${fromId}] Received offer while in 'have-local-offer' state. Handling as new offer.`);
+        // This is where "glare" handling comes in. For now, we'll try to setRemoteDescription directly.
+        // In a real app, you might re-negotiate or reject based on a tie-breaker.
+        // For simplicity, we proceed, as setRemoteDescription will attempt to update state.
+    } else if (pc.signalingState === 'stable') {
+        // If stable and receiving an offer, it's a fresh incoming offer.
+        addLog('system', `[${fromId}] Received offer in 'stable' state. Processing new offer.`);
+    }
+
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
     const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
+    await pc.setLocalDescription(answer); // Set local description before sending
     sendSignalingMessage('answer', { sdp: answer }, fromId);
     addLog('sent', `Sent WebRTC Answer to ${fromId}`);
   } catch (error) {
@@ -430,6 +476,10 @@ const handleAnswer = async (sdp, fromId) => {
     return;
   }
   try {
+    // Ensure we are in a state that can accept an answer (e.g., have-local-offer)
+    if (pcInfo.pc.signalingState !== 'have-local-offer') {
+        addLog('warn', `[${fromId}] Received answer while in state ${pcInfo.pc.signalingState}. Expected 'have-local-offer'.`);
+    }
     await pcInfo.pc.setRemoteDescription(new RTCSessionDescription(sdp));
   } catch (error) {
     addLog('error', `Error handling answer from ${fromId}: ${error.message}`);
@@ -445,7 +495,10 @@ const handleCandidate = async (candidate, fromId) => {
   try {
     await pcInfo.pc.addIceCandidate(new RTCIceCandidate(candidate));
   } catch (error) {
-    addLog('error', `Error adding ICE candidate from ${fromId}: ${error.message}`);
+    // This error often happens if a candidate arrives when setRemoteDescription hasn't completed yet
+    // or if connection is already established/closed. It's usually safe to ignore if the connection
+    // eventually forms. Log for debugging but don't show as a prominent error to user.
+    addLog('error', `[${fromId}] Error adding ICE candidate: ${error.message}`);
   }
 };
 
@@ -471,9 +524,9 @@ const sendFileBroadcast = async () => {
   }
 
   const file = selectedFile.value;
-  const fileId = `${mySessionId.value}-${Date.now()}-${file.name}`; // Unique ID for this file transfer
+  const fileId = `${mySessionId.value}-${Date.now()}-${file.name}`;
 
-  // 1. Send file metadata over ALL open data channels (as a JSON string)
+  // 1. Send file metadata over ALL open data channels
   const metadata = {
     type: 'file-metadata-signal',
     fileId: fileId,
@@ -487,9 +540,9 @@ const sendFileBroadcast = async () => {
   activeDataChannels.forEach(dc => {
     try {
       dc.send(metadataPayload);
-      addLog('sent', `Sent file metadata to peer (${dc.label}) for ${file.name} (ID: ${fileId})`);
+      addLog('sent', `[${dc.label.split('-')[0]}] Sent file metadata for ${file.name}`);
     } catch (e) {
-      addLog('error', `Failed to send metadata via data channel: ${e.message}`);
+      addLog('error', `[${dc.label.split('-')[0]}] Failed to send metadata: ${e.message}`);
     }
   });
 
@@ -500,35 +553,31 @@ const sendFileBroadcast = async () => {
   const reader = new FileReader();
 
   reader.onload = (e) => {
-    const chunk = e.target.result; // This is an ArrayBuffer
-    const header = new Uint8Array(1 + 4 + 1 + new TextEncoder().encode(fileId).byteLength); // fileIdLen (1 byte) + fileId + chunkIndex (4 bytes) + isLastChunk (1 byte)
+    const chunk = e.target.result;
+    const header = new Uint8Array(1 + 4 + 1 + new TextEncoder().encode(fileId).byteLength);
     let headerOffset = 0;
 
-    // Encode fileId
     const fileIdBytes = new TextEncoder().encode(fileId);
     header[headerOffset++] = fileIdBytes.byteLength;
     header.set(fileIdBytes, headerOffset);
     headerOffset += fileIdBytes.byteLength;
 
-    // Encode chunkIndex
     const chunkIndex = Math.floor(offset / CHUNK_SIZE);
     new DataView(header.buffer).setUint32(headerOffset, chunkIndex, true);
     headerOffset += 4;
 
-    // Encode isLastChunk
     const isLastChunk = (offset + chunk.byteLength) >= file.size;
     header[headerOffset++] = isLastChunk ? 1 : 0;
 
-    // Concatenate header and chunk data
     const combinedBuffer = new Uint8Array(header.byteLength + chunk.byteLength);
     combinedBuffer.set(header, 0);
     combinedBuffer.set(new Uint8Array(chunk), header.byteLength);
 
     activeDataChannels.forEach(dc => {
         try {
-            dc.send(combinedBuffer.buffer); // Send ArrayBuffer!
+            dc.send(combinedBuffer.buffer);
         } catch (e) {
-            addLog('error', `Failed to send file chunk via data channel: ${e.message}`);
+            addLog('error', `[${dc.label.split('-')[0]}] Failed to send file chunk: ${e.message}`);
         }
     });
 
@@ -539,7 +588,6 @@ const sendFileBroadcast = async () => {
       readNextChunk();
     } else {
       addLog('sent', `Finished sending all chunks for ${file.name} to all active peers.`);
-      // Send a final completion signal over ALL open data channels
       const completeSignalPayload = JSON.stringify({
         type: 'file-transfer-complete-signal',
         fileId: fileId,
@@ -550,11 +598,11 @@ const sendFileBroadcast = async () => {
           try {
               dc.send(completeSignalPayload);
           } catch (e) {
-              addLog('error', `Failed to send completion signal via data channel: ${e.message}`);
+              addLog('error', `[${dc.label.split('-')[0]}] Failed to send completion signal: ${e.message}`);
           }
       });
 
-      selectedFile.value = null; // Clear selected file
+      selectedFile.value = null;
       if (document.querySelector('input[type="file"]')) {
         document.querySelector('input[type="file"]').value = '';
       }
@@ -571,7 +619,7 @@ const sendFileBroadcast = async () => {
     reader.readAsArrayBuffer(slice);
   };
 
-  readNextChunk(); // Start reading the first chunk
+  readNextChunk();
 };
 
 
@@ -583,136 +631,220 @@ onUnmounted(() => {
   if (ws.value) {
     ws.value.close();
   }
-  // Close all active peer connections
   Object.keys(peerConnections).forEach(peerId => closePeerConnection(peerId));
 });
 </script>
 
 <style scoped>
-/* Your existing CSS styles */
+/* Simplified CSS for the refined UI */
 .webrtc-file-transfer-container {
   font-family: Arial, sans-serif;
-  max-width: 800px;
+  max-width: 600px; /* Make it a bit narrower */
   margin: 20px auto;
-  padding: 20px;
+  padding: 25px; /* More padding */
   border: 1px solid #ddd;
-  border-radius: 8px;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-  background-color: #f9f9f9;
+  border-radius: 10px; /* More rounded corners */
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); /* Stronger shadow */
+  background-color: #ffffff; /* White background */
 }
 
-h2, h3 {
-  color: #333;
+h2 {
+  text-align: center;
+  color: #2c3e50;
+  margin-bottom: 25px;
+  font-size: 1.8em;
+}
+
+h3 {
+  color: #34495e;
   margin-bottom: 15px;
   border-bottom: 1px solid #eee;
   padding-bottom: 5px;
+  font-size: 1.2em;
 }
 
-.connection-status, .peer-selection-section {
-  margin-bottom: 20px;
-  padding: 10px;
-  background-color: #eef;
-  border-radius: 4px;
-  border: 1px solid #dde;
+.connection-info {
+  background-color: #e8f5e9; /* Light green */
+  border: 1px solid #a5d6a7; /* Darker green border */
+  border-radius: 8px;
+  padding: 15px;
+  margin-bottom: 25px;
+  text-align: center;
+}
+
+.connection-info p {
+  margin: 5px 0;
+  font-size: 1em;
+  color: #388e3c; /* Green text */
+}
+
+.my-id, .connected-peers-count {
+  font-weight: bold;
+  color: #1b5e20; /* Darker green */
 }
 
 .status-connected {
-  color: green;
+  color: #28a745; /* Green */
   font-weight: bold;
 }
 
 .status-disconnected {
-  color: red;
+  color: #dc3545; /* Red */
   font-weight: bold;
 }
 
-.peer-select, .file-transfer-section input[type="file"],
+.file-transfer-section {
+  background-color: #f8f9fa; /* Light grey */
+  border: 1px solid #e9ecef;
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 25px;
+}
+
+.file-transfer-section input[type="file"] {
+  display: block; /* Stack on new line */
+  width: calc(100% - 20px); /* Adjust for padding */
+  padding: 10px;
+  border: 1px solid #ced4da;
+  border-radius: 5px;
+  margin-bottom: 15px;
+  box-sizing: border-box; /* Include padding in width */
+}
+
 .file-transfer-section button {
-  margin-right: 10px;
-  padding: 8px 12px;
-  border: 1px solid #ccc;
-  border-radius: 4px;
-}
-
-.peer-select {
-    min-width: 200px;
-}
-
-.peer-selection-section button, .file-transfer-section button {
+  width: 100%; /* Full width */
+  padding: 12px 20px;
   background-color: #007bff;
   color: white;
   border: none;
+  border-radius: 5px;
   cursor: pointer;
+  font-size: 1em;
   transition: background-color 0.3s ease;
 }
 
-.peer-selection-section button:disabled, .file-transfer-section button:disabled {
+.file-transfer-section button:disabled {
   background-color: #cccccc;
   cursor: not-allowed;
 }
 
-.peer-selection-section button:hover:enabled, .file-transfer-section button:hover:enabled {
+.file-transfer-section button:hover:enabled {
   background-color: #0056b3;
 }
 
-.file-transfer-section {
-    margin-top: 20px;
-    padding: 15px;
-    background-color: #fff;
-    border: 1px solid #eee;
-    border-radius: 4px;
-}
-
 .file-transfer-section p {
-    margin-top: 10px;
-    color: #555;
+  margin-top: 15px;
+  color: #555;
+  font-size: 0.95em;
 }
 
 .progress-bar-container {
   width: 100%;
   background-color: #e0e0e0;
   border-radius: 5px;
-  margin-top: 10px;
-  height: 20px;
+  margin-top: 15px;
+  height: 25px; /* Taller progress bar */
   position: relative;
+  overflow: hidden; /* Hide overflow for bar */
 }
 
 .progress-bar {
   height: 100%;
-  background-color: #4CAF50;
+  background-color: #28a745; /* Green */
   border-radius: 5px;
   text-align: center;
   color: white;
-  transition: width 0.1s ease-out; /* Smooth progress update */
+  transition: width 0.1s ease-out;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.9em;
 }
 
 .progress-bar-container span {
     position: absolute;
     width: 100%;
     text-align: center;
-    line-height: 20px;
-    color: #333;
+    line-height: 25px; /* Center text vertically */
+    color: #333; /* Darker text for visibility */
     font-size: 0.9em;
     font-weight: bold;
+    text-shadow: 0 0 2px rgba(255,255,255,0.7); /* Add slight text shadow */
 }
 
 
+.received-files-section {
+  background-color: #ffffff;
+  border: 1px solid #eee;
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 25px;
+}
+
+.received-files-section ul {
+  list-style: none;
+  padding: 0;
+}
+
+.received-file-item {
+  padding: 12px 0;
+  border-bottom: 1px dotted #e0e0e0;
+  text-align: left;
+}
+
+.received-file-item:last-child {
+  border-bottom: none;
+}
+
+.file-info {
+  margin-right: 15px;
+  color: #333;
+  font-size: 0.95em;
+}
+
+.download-link {
+  display: inline-block;
+  padding: 6px 12px;
+  background-color: #6c757d;
+  color: white;
+  text-decoration: none;
+  border-radius: 4px;
+  transition: background-color 0.3s ease;
+  font-size: 0.9em;
+}
+
+.download-link:hover {
+  background-color: #5a6268;
+}
+
+.error-message {
+  color: #dc3545;
+  margin-top: 15px;
+  font-weight: bold;
+}
+
+/* Log styles (kept for debugging, but minimized) */
 .message-log {
   margin-top: 20px;
-  background-color: #fff;
-  border: 1px solid #eee;
-  border-radius: 4px;
+  background-color: #f0f4f7; /* Lighter background for logs */
+  border: 1px solid #dcdcdc;
+  border-radius: 8px;
   padding: 15px;
-  max-height: 300px;
+  max-height: 200px; /* Smaller log height */
   overflow-y: auto;
+  font-size: 0.8em; /* Smaller font for logs */
+}
+
+.message-log h3 {
+    margin-bottom: 10px;
+    border-bottom: 1px dotted #ccc;
+    padding-bottom: 5px;
 }
 
 .log-item {
-  padding: 5px 0;
-  border-bottom: 1px dotted #eee;
-  font-size: 0.9em;
+  padding: 3px 0;
+  border-bottom: 1px dotted #e8e8e8;
   color: #666;
-  text-align: left;
 }
 
 .log-item:last-child {
@@ -742,51 +874,7 @@ h2, h3 {
   color: #dc3545;
   font-weight: bold;
 }
-
-.received-files-section {
-  margin-top: 20px;
-  background-color: #fff;
-  border: 1px solid #eee;
-  border-radius: 4px;
-  padding: 15px;
-}
-
-.received-files-section ul {
-  list-style: none;
-  padding: 0;
-}
-
-.received-file-item {
-  padding: 10px 0;
-  border-bottom: 1px dotted #eee;
-  text-align: left;
-}
-
-.received-file-item:last-child {
-  border-bottom: none;
-}
-
-.file-info {
-  margin-right: 15px;
-  color: #333;
-}
-
-.download-link {
-  display: inline-block;
-  padding: 5px 10px;
-  background-color: #6c757d;
-  color: white;
-  text-decoration: none;
-  border-radius: 4px;
-  transition: background-color 0.3s ease;
-}
-
-.download-link:hover {
-  background-color: #5a6268;
-}
-
-.error-message {
-  color: red;
-  margin-top: 10px;
+.log-item.warn {
+  color: orange;
 }
 </style>
