@@ -41,6 +41,7 @@ import { ref, onMounted, onUnmounted, reactive, computed } from 'vue';
 const ws = ref(null);
 const isWsConnected = ref(false);
 const mySessionId = ref('');
+const heartbeatIntervalId = ref(null); // 用于存放我们的心跳定时器ID
 
 const peerConnections = reactive({});
 
@@ -80,11 +81,33 @@ const formatBytes = (bytes, decimals = 2) => {
 
 // Removed addLog function and all its calls
 
+
+
+  // --- 新增心跳函数 ---
+  const startHeartbeat = () => {
+    console.log('启动心跳机制...');
+    heartbeatIntervalId.value = setInterval(() => {
+      if (ws.value && ws.value.readyState === WebSocket.OPEN) {
+        // 发送 ping 消息
+        sendMessage({ type: 'ping' });
+      }
+    }, 30000); // 每 30 秒发送一次
+  };
+
+    const stopHeartbeat = () => {
+    console.log('停止心跳机制...');
+    if (heartbeatIntervalId.value) {
+      clearInterval(heartbeatIntervalId.value);
+      heartbeatIntervalId.value = null;
+    }
+  };
+
 // --- WebSocket Signaling Logic ---
 const connectWebSocket = () => {
   ws.value = new WebSocket(wsUrl);
 
   ws.value.onopen = () => {
+    startHeartbeat(); 
     isWsConnected.value = true;
     // Periodically send ping to keep connection alive
     setInterval(() => {
