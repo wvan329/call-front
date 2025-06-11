@@ -53,39 +53,43 @@ const ws = ref(null);
 const isWsConnected = ref(false);
 const mySessionId = ref('');
 const heartbeatIntervalId = ref(null);
-
-// Store PeerConnection and DataChannel info for each peer
 const peerConnections = reactive({});
-
 const selectedFile = ref(null);
-const sendFileProgress = ref(0); // Global progress for the sending file
+const sendFileProgress = ref(0);
 const fileTransferError = ref('');
-
-const receivedFiles = reactive([]); // List of received files for display
-
-// Store buffers for incoming files, indexed by fileId
+const receivedFiles = reactive([]);
 const incomingFileBuffers = {};
 
-// Helper computed property to check if any data channel is open
+// 动态缓冲区配置
+const DYNAMIC_BUFFER_CONFIG = reactive({
+  baseSize: 1 * 1024 * 1024,    // 1MB基础大小
+  maxSize: 16 * 1024 * 1024,    // 16MB最大限制
+  currentSize: 1 * 1024 * 1024  // 当前缓冲区大小
+});
+
+// 传输统计
+const transferStats = reactive({
+  speed: 0,
+  lastBytesSent: 0,
+  lastTime: 0
+});
+
 const isAnyDataChannelOpen = computed(() => {
   return Object.values(peerConnections).some(pcInfo => pcInfo.dc && pcInfo.dc.readyState === 'open');
 });
 
-// --- WebRTC Configuration ---
+// WebRTC配置
 const RTC_CONFIG = {
   iceServers: [
     { urls: 'stun:59.110.35.198:3478' }
   ]
 };
 
-// --- File Transfer Constants ---
-const CHUNK_SIZE = 16 * 1024; // 16KB per chunk
-const MAX_BUFFERED_AMOUNT = 50 * 1024 * 1024; // 1MB, increased for better throughput, adjust as needed
+// 文件传输常量
+const CHUNK_SIZE = 64 * 1024; // 64KB per chunk
+const PARALLEL_STREAMS = 3;   // 并行数据流数量
 
-// Your WebSocket signaling server URL
-const wsUrl = 'ws://59.110.35.198/wgk/ws/file';
-
-// --- Utility Functions ---
+// 工具函数保持不变
 const formatBytes = (bytes, decimals = 2) => {
   if (bytes === 0) return '0 Bytes';
   const k = 1024;
@@ -94,6 +98,361 @@ const formatBytes = (bytes, decimals = 2) => {
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 };
+
+// 动态调整缓冲区大小
+const adjustBufferSize = (dc) => {
+  if (!dc) return;
+  
+  // 计算当前传输速度
+  const now = Date.now();
+  if (transferStats.lastTime > 0) {
+    const timeDiff = (now - transferStats.lastTime) / 1000;
+    const bytesDiff = dc.bytesSent - transferStats.lastBytesSent;
+    transferStats.speed = bytesDiff / timeDiff;
+  }
+  transferStats.lastBytesSent = dc.bytesSent;
+  transferStats.lastTime = now;
+  
+  // 根据网络状况调整缓冲区
+  if (transferStats.speed > 5 * 1024 * 1024) { // >5MB/s
+    DYNAMIC_BUFFER_CONFIG.currentSize = Math.min(
+      DYNAMIC_BUFFER_CONFIG.currentSize + (1 * 1024 * 1024),
+      DYNAMIC_BUFFER_CONFIG.maxSize
+    );
+  } else if (transferStats.speed < 1 * 1024 * 1024) { // <1MB/s
+    DYNAMIC_BUFFER_CONFIG.currentSize = Math.max(
+      DYNAMIC_BUFFER_CONFIG.currentSize - (0.5 * 1024 * 1024),
+      DYNAMIC_BUFFER_CONFIG.baseSize
+    );
+  }
+};
+
+// 创建增强型PeerConnection
+const createEnhancedPeerConnection = (targetPeerId) => {
+  if (peerConnections[targetPeerId]?.pc) {
+    return peerConnections[targetPeerId].pc;
+  }
+
+  console.log(`[${mySessionId.value}] 创建增强型PeerConnection给 ${targetPeerId}`);
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  
+  // 初始化并行数据流
+  const streams = Array(PARALLEL_STREAMS).fill().map((_, i) => ({
+    dc: null,
+    fileQueue: [],
+    currentTransfer: null
+  }));
+  
+  peerConnections[targetPeerId] = { 
+    pc,
+    streams,
+    stats: {
+      bytesSent: 0,
+      speed: 0
+    }
+  };
+
+  // ICE Candidate处理
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      sendSignalingMessage('candidate', { candidate: event.candidate }, targetPeerId);
+    }
+  };
+
+  // 连接状态处理
+  pc.oniceconnectionstatechange = () => {
+    if (pc.iceConnectionState === 'failed') {
+      closePeerConnection(targetPeerId);
+    }
+  };
+
+  // 数据通道处理
+  pc.ondatachannel = (event) => {
+    const channel = event.channel;
+    const streamIndex = parseInt(channel.label.split('-').pop()) || 0;
+    
+    if (peerConnections[targetPeerId]?.streams[streamIndex]) {
+      peerConnections[targetPeerId].streams[streamIndex].dc = channel;
+      setupDataChannelListeners(channel, targetPeerId, streamIndex);
+    }
+  };
+
+  // 为每个并行流创建数据通道
+  streams.forEach((_, index) => {
+    const dc = pc.createDataChannel(`file-stream-${index}`, {
+      ordered: true,
+      maxRetransmits: 30 // 适当增加重传次数
+    });
+    streams[index].dc = dc;
+    setupDataChannelListeners(dc, targetPeerId, index);
+  });
+
+  return pc;
+};
+
+// 增强的数据通道监听器
+const setupDataChannelListeners = (channel, peerId, streamIndex) => {
+  channel.onopen = () => {
+    console.log(`[${mySessionId.value}] 数据通道 ${streamIndex} 已连接 ${peerId}`);
+    startStreamTransfer(peerId, streamIndex);
+  };
+
+  channel.onclose = () => {
+    console.log(`[${mySessionId.value}] 数据通道 ${streamIndex} 已断开 ${peerId}`);
+    if (peerConnections[peerId]?.streams[streamIndex]) {
+      peerConnections[peerId].streams[streamIndex].dc = null;
+    }
+  };
+
+  channel.onerror = (error) => {
+    console.error(`[${mySessionId.value}] 数据通道 ${streamIndex} 错误 ${peerId}:`, error);
+  };
+
+  channel.onbufferedamountlow = () => {
+    startStreamTransfer(peerId, streamIndex);
+  };
+
+  // 接收文件处理保持不变
+  channel.onmessage = async (event) => {
+    // 保持原有接收文件逻辑
+  };
+};
+
+// 启动流传输
+const startStreamTransfer = (peerId, streamIndex) => {
+  const stream = peerConnections[peerId]?.streams[streamIndex];
+  if (!stream || !stream.dc || stream.dc.readyState !== 'open') return;
+  
+  // 如果没有正在传输的文件，从队列中取一个
+  if (!stream.currentTransfer && stream.fileQueue.length > 0) {
+    stream.currentTransfer = stream.fileQueue.shift();
+    sendFileMetadata(stream.dc, stream.currentTransfer);
+  }
+  
+  // 如果有正在传输的文件，继续传输
+  if (stream.currentTransfer && stream.dc.bufferedAmount < DYNAMIC_BUFFER_CONFIG.currentSize) {
+    sendNextChunk(peerId, streamIndex);
+  }
+};
+
+// 发送文件元数据
+const sendFileMetadata = (dc, transfer) => {
+  const metadata = {
+    type: 'file-metadata-signal',
+    fileId: transfer.fileId,
+    fileName: transfer.file.name,
+    fileType: transfer.file.type || 'application/octet-stream',
+    fileSize: transfer.file.size,
+    from: mySessionId.value,
+    streamIndex: transfer.streamIndex
+  };
+  
+  try {
+    dc.send(JSON.stringify(metadata));
+    console.log(`[${mySessionId.value}] 发送元数据 ${transfer.fileId}`);
+  } catch (e) {
+    console.error(`[${mySessionId.value}] 发送元数据失败:`, e);
+  }
+};
+
+// 发送下一个数据块
+const sendNextChunk = async (peerId, streamIndex) => {
+  const stream = peerConnections[peerId]?.streams[streamIndex];
+  if (!stream || !stream.currentTransfer) return;
+  
+  const { file, fileId, offset, reader } = stream.currentTransfer;
+  
+  if (offset >= file.size) {
+    // 文件传输完成
+    sendTransferComplete(stream.dc, fileId);
+    stream.currentTransfer.resolve();
+    stream.currentTransfer = null;
+    startStreamTransfer(peerId, streamIndex); // 检查队列中下一个文件
+    return;
+  }
+  
+  const slice = file.slice(offset, offset + CHUNK_SIZE);
+  reader.readAsArrayBuffer(slice);
+  
+  reader.onload = async (e) => {
+    const chunk = e.target.result;
+    const chunkIndex = Math.floor(offset / CHUNK_SIZE);
+    const isLastChunk = (offset + chunk.byteLength) >= file.size;
+    
+    try {
+      const chunkPacket = createChunkPacket(fileId, chunkIndex, isLastChunk, chunk);
+      
+      // 动态调整缓冲区
+      adjustBufferSize(stream.dc);
+      
+      // 检查缓冲区状态
+      if (stream.dc.bufferedAmount < DYNAMIC_BUFFER_CONFIG.currentSize) {
+        stream.dc.send(chunkPacket);
+        stream.currentTransfer.offset += chunk.byteLength;
+        
+        // 更新进度
+        const newProgress = (stream.currentTransfer.offset / file.size) * 100;
+        sendFileProgress.value = Math.max(sendFileProgress.value, newProgress);
+        
+        // 如果还有空间，继续发送下一个块
+        if (stream.dc.bufferedAmount < DYNAMIC_BUFFER_CONFIG.currentSize * 0.8) {
+          sendNextChunk(peerId, streamIndex);
+        }
+      }
+    } catch (e) {
+      console.error(`[${mySessionId.value}] 发送块失败:`, e);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      sendNextChunk(peerId, streamIndex); // 重试
+    }
+  };
+  
+  reader.onerror = (error) => {
+    console.error(`[${mySessionId.value}] 文件读取错误:`, error);
+    stream.currentTransfer.reject(error);
+    stream.currentTransfer = null;
+  };
+};
+
+// 创建数据块包
+const createChunkPacket = (fileId, chunkIndex, isLastChunk, chunkData) => {
+  const fileIdBytes = new TextEncoder().encode(fileId);
+  const header = new Uint8Array(1 + fileIdBytes.length + 4 + 1);
+  let offset = 0;
+  
+  header[offset++] = fileIdBytes.length;
+  header.set(fileIdBytes, offset);
+  offset += fileIdBytes.length;
+  
+  new DataView(header.buffer).setUint32(offset, chunkIndex, true);
+  offset += 4;
+  
+  header[offset++] = isLastChunk ? 1 : 0;
+  
+  const packet = new Uint8Array(header.length + chunkData.byteLength);
+  packet.set(header, 0);
+  packet.set(new Uint8Array(chunkData), header.length);
+  
+  return packet.buffer;
+};
+
+// 发送传输完成信号
+const sendTransferComplete = (dc, fileId) => {
+  const completeSignal = {
+    type: 'file-transfer-complete-signal',
+    fileId: fileId,
+    from: mySessionId.value
+  };
+  
+  try {
+    dc.send(JSON.stringify(completeSignal));
+  } catch (e) {
+    console.error(`[${mySessionId.value}] 发送完成信号失败:`, e);
+  }
+};
+
+// 发送文件到对等端 (修改后的版本)
+const sendFileToPeer = (targetPeerId, file) => {
+  if (!peerConnections[targetPeerId]) {
+    console.warn(`[${mySessionId.value}] 无连接 ${targetPeerId}`);
+    return Promise.reject(new Error(`No connection to ${targetPeerId}`));
+  }
+  
+  const fileId = `${mySessionId.value}-${Date.now()}-${file.name}`;
+  const fileSize = file.size;
+  const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
+  const chunksPerStream = Math.ceil(totalChunks / PARALLEL_STREAMS);
+  
+  // 为每个流创建传输任务
+  const transferPromises = peerConnections[targetPeerId].streams.map((stream, index) => {
+    return new Promise((resolve, reject) => {
+      const startChunk = index * chunksPerStream;
+      const endChunk = Math.min((index + 1) * chunksPerStream, totalChunks);
+      const startOffset = startChunk * CHUNK_SIZE;
+      const endOffset = Math.min(endChunk * CHUNK_SIZE, fileSize);
+      
+      if (startOffset >= endOffset) {
+        resolve(); // 没有数据需要这个流传输
+        return;
+      }
+      
+      const transfer = {
+        file: file,
+        fileId: fileId,
+        offset: startOffset,
+        endOffset: endOffset,
+        reader: new FileReader(),
+        isSending: false,
+        resolve,
+        reject,
+        streamIndex: index
+      };
+      
+      stream.fileQueue.push(transfer);
+      startStreamTransfer(targetPeerId, index);
+    });
+  });
+  
+  return Promise.all(transferPromises);
+};
+
+// 文件广播函数 (修改后的版本)
+const sendFileBroadcast = async () => {
+  if (!selectedFile.value) {
+    fileTransferError.value = '未选择文件';
+    return;
+  }
+  
+  const activePeers = Object.keys(peerConnections).filter(peerId => 
+    peerConnections[peerId].streams.some(s => s.dc?.readyState === 'open')
+  );
+  
+  if (activePeers.length === 0) {
+    fileTransferError.value = '没有活跃的对等连接';
+    return;
+  }
+  
+  fileTransferError.value = '';
+  sendFileProgress.value = 0;
+  transferStats.speed = 0;
+  transferStats.lastBytesSent = 0;
+  transferStats.lastTime = Date.now();
+  
+  try {
+    const broadcastPromises = activePeers.map(peerId => 
+      sendFileToPeer(peerId, selectedFile.value)
+    );
+    
+    await Promise.all(broadcastPromises);
+    sendFileProgress.value = 100;
+    console.log(`[${mySessionId.value}] 文件广播完成`);
+  } catch (error) {
+    console.error(`[${mySessionId.value}] 广播错误:`, error);
+    fileTransferError.value = `广播失败: ${error.message}`;
+  }
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+const MAX_BUFFERED_AMOUNT = 1 * 1024 * 1024; // 1MB, increased for better throughput, adjust as needed
+
+// Your WebSocket signaling server URL
+const wsUrl = 'ws://59.110.35.198/wgk/ws/file';
 
 // --- WebSocket Heartbeat ---
 const startHeartbeat = () => {
@@ -283,196 +642,6 @@ const createPeerConnection = (targetPeerId, isOfferer = true) => {
   return pc;
 };
 
-const setupDataChannelListeners = (channel, peerId) => {
-  channel.onopen = () => {
-    console.log(`[${mySessionId.value}] DataChannel to ${peerId} 打开！ (readyState: ${channel.readyState})`);
-    fileTransferError.value = ''; // Clear any previous error
-    const pcInfo = peerConnections[peerId];
-    if (pcInfo && pcInfo.fileQueue.length > 0) {
-      const currentFileTransfer = pcInfo.fileQueue[0];
-      // Only start if not already sending and buffer is empty
-      if (!currentFileTransfer.isSending && channel.bufferedAmount === 0) {
-        console.log(`[${mySessionId.value}] DataChannel for ${peerId} opened, starting queued file ${currentFileTransfer.fileId}.`);
-        currentFileTransfer.isSending = true;
-        // Make sure metadata is sent if it wasn't already (e.g., if DC wasn't open when sendFileToPeer was called)
-        const metadata = {
-          type: 'file-metadata-signal',
-          fileId: currentFileTransfer.fileId,
-          fileName: currentFileTransfer.file.name,
-          fileType: currentFileTransfer.file.type || 'application/octet-stream',
-          fileSize: currentFileTransfer.file.size,
-          from: mySessionId.value
-        };
-        channel.send(JSON.stringify(metadata));
-        console.log(`[${mySessionId.value}] Sent queued metadata for ${currentFileTransfer.fileId} to ${peerId}.`);
-        readNextChunk(currentFileTransfer);
-      } else {
-        console.log(`[${mySessionId.value}] DataChannel for ${peerId} opened, but queue is already processing or buffer not empty.`);
-      }
-    }
-  };
-
-  channel.onclose = () => {
-    console.log(`[${mySessionId.value}] DataChannel to ${peerId} 关闭。`);
-    if (peerConnections[peerId]) {
-      peerConnections[peerId].dc = null;
-    }
-  };
-
-  channel.onerror = (error) => {
-    console.error(`[${mySessionId.value}] DataChannel to ${peerId} 错误: ${error.message || error}`);
-  };
-
-  channel.onbufferedamountlow = () => {
-    const pcInfo = peerConnections[peerId];
-    if (pcInfo && pcInfo.fileQueue.length > 0) {
-      const currentFileTransfer = pcInfo.fileQueue[0];
-      // Continue sending if this file is actively sending and more chunks are needed
-      if (currentFileTransfer.isSending && currentFileTransfer.offset < currentFileTransfer.file.size) {
-        console.log(`[${mySessionId.value}] DataChannel bufferedAmountLow for ${peerId}, continuing transfer for ${currentFileTransfer.fileId}. Buffered amount: ${channel.bufferedAmount}`);
-        readNextChunk(currentFileTransfer);
-      } else if (channel.bufferedAmount === 0 && !currentFileTransfer.isSending && currentFileTransfer.offset === 0) {
-          // Edge case: DC opened with file in queue, and bufferedAmount is low/zero, but isSending was never true
-          console.log(`[${mySessionId.value}] DataChannel bufferedAmountLow, starting *new* queued transfer for ${currentFileTransfer.fileId} to ${peerId}.`);
-          currentFileTransfer.isSending = true;
-          // Ensure metadata is sent here too if it wasn't already
-          const metadata = {
-            type: 'file-metadata-signal',
-            fileId: currentFileTransfer.fileId,
-            fileName: currentFileTransfer.file.name,
-            fileType: currentFileTransfer.file.type || 'application/octet-stream',
-            fileSize: currentFileTransfer.file.size,
-            from: mySessionId.value
-          };
-          channel.send(JSON.stringify(metadata));
-          console.log(`[${mySessionId.value}] Sent queued metadata (onbufferedamountlow) for ${currentFileTransfer.fileId} to ${peerId}.`);
-          readNextChunk(currentFileTransfer);
-      }
-    }
-  };
-
-
-  channel.onmessage = async (event) => {
-    const receivedData = event.data;
-
-    try {
-      if (typeof receivedData === 'string') {
-        const parsedData = JSON.parse(receivedData);
-        if (parsedData.type === 'file-metadata-signal') {
-          const { fileId, fileName, fileType, fileSize, from } = parsedData;
-          console.log(`[${mySessionId.value}] 收到文件元数据 for ${fileId}: ${fileName} (${formatBytes(fileSize)}) 来自 ${from}`);
-          if (incomingFileBuffers[fileId]) {
-              console.warn(`[${mySessionId.value}] 收到重复的文件元数据 for ${fileId}.`);
-              return;
-          }
-
-          const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
-          const newFileItem = reactive({
-            metadata: { fileName, fileType, fileSize },
-            url: null,
-            progress: 0,
-            receivedSize: 0, // Track received size for this file
-            index: receivedFiles.length // For array indexing if needed
-          });
-          receivedFiles.push(newFileItem);
-
-          incomingFileBuffers[fileId] = {
-            metadata: { fileName, fileType, fileSize },
-            chunks: new Array(totalChunks).fill(null), // Pre-allocate array with nulls
-            receivedSize: 0,
-            from: from,
-            progress: 0,
-            index: receivedFiles.length - 1, // Point to the reactive item's index
-            receivedChunkIndices: new Set(),
-            totalChunks: totalChunks,
-            reactiveItem: newFileItem // Reference to the reactive object in receivedFiles
-          };
-
-        } else if (parsedData.type === 'file-transfer-complete-signal') {
-          console.log(`[${mySessionId.value}] 收到文件传输完成信号 for ${parsedData.fileId}.`);
-          const fileBuffer = incomingFileBuffers[parsedData.fileId];
-          if (fileBuffer) {
-            // Final check on received size and chunk count
-            if (fileBuffer.receivedSize === fileBuffer.metadata.fileSize && fileBuffer.receivedChunkIndices.size === fileBuffer.totalChunks) {
-                console.log(`[${mySessionId.value}] 文件 ${fileBuffer.metadata.fileName} 成功接收并重组。`);
-                // If not already done by last chunk
-                if (!fileBuffer.reactiveItem.url) {
-                    const fullBuffer = concatenateArrayBuffers(fileBuffer.chunks);
-                    const blob = new Blob([fullBuffer], { type: fileBuffer.metadata.fileType });
-                    const url = URL.createObjectURL(blob);
-                    fileBuffer.reactiveItem.url = url;
-                    fileBuffer.reactiveItem.progress = 100;
-                    console.log(`[${mySessionId.value}] File ${fileBuffer.metadata.fileName} final Blob created.`);
-                }
-            } else {
-                console.warn(`[${mySessionId.value}] 文件 ${fileBuffer.metadata.fileName} 收到完成信号，但大小不匹配或有缺失块。`);
-                fileTransferError.value = `文件 ${fileBuffer.metadata.fileName} 接收不完整。`;
-                // Optionally clean up here or keep for manual retry/inspection
-            }
-            // Always delete the buffer to free memory after processing completion signal
-            delete incomingFileBuffers[parsedData.fileId];
-          } else {
-              console.warn(`[${mySessionId.value}] 收到未知文件ID的完成信号: ${parsedData.fileId}.`);
-          }
-        } else {
-          console.warn(`[${mySessionId.value}] DataChannel String (未知类型) from ${peerId}: ${receivedData}`);
-        }
-      } else if (receivedData instanceof ArrayBuffer) {
-        // Data is a file chunk
-        const view = new DataView(receivedData);
-        const fileIdLen = view.getUint8(0);
-        const fileId = new TextDecoder().decode(receivedData.slice(1, 1 + fileIdLen));
-        const chunkIndex = view.getUint32(1 + fileIdLen, true); // true for little-endian
-        const isLastChunkFlag = view.getUint8(1 + fileIdLen + 4); // For reference, not primary check
-        const chunkData = receivedData.slice(1 + fileIdLen + 4 + 1);
-
-        if (!incomingFileBuffers[fileId]) {
-          console.error(`[${mySessionId.value}] 收到未知文件ID的块: ${fileId} (chunkIndex: ${chunkIndex}). 元数据可能丢失或顺序错误。`);
-          return;
-        }
-
-        const fileBuffer = incomingFileBuffers[fileId];
-
-        if (fileBuffer.receivedChunkIndices.has(chunkIndex)) {
-            // console.warn(`[${mySessionId.value}] 收到重复的块 for fileId ${fileId}, chunkIndex ${chunkIndex}.`);
-            return; // Ignore duplicate chunks
-        }
-
-        fileBuffer.chunks[chunkIndex] = chunkData;
-        fileBuffer.receivedSize += chunkData.byteLength;
-        fileBuffer.receivedChunkIndices.add(chunkIndex);
-
-        // Update reactive progress for the specific file
-        if (fileBuffer.reactiveItem) {
-          fileBuffer.reactiveItem.receivedSize = fileBuffer.receivedSize; // Update for UI tracking
-          fileBuffer.reactiveItem.progress = (fileBuffer.receivedSize / fileBuffer.metadata.fileSize) * 100;
-          // console.log(`[${mySessionId.value}] File ${fileBuffer.metadata.fileName} progress: ${fileBuffer.reactiveItem.progress.toFixed(2)}%`);
-        }
-
-        // Only try to reassemble if all expected chunks are received AND total size matches
-        if (fileBuffer.receivedSize === fileBuffer.metadata.fileSize && fileBuffer.receivedChunkIndices.size === fileBuffer.totalChunks) {
-          console.log(`[${mySessionId.value}] 所有块已接收 for ${fileId}，开始重组文件。`);
-          const fullBuffer = concatenateArrayBuffers(fileBuffer.chunks);
-          const blob = new Blob([fullBuffer], { type: fileBuffer.metadata.fileType });
-          const url = URL.createObjectURL(blob);
-
-          if (fileBuffer.reactiveItem) {
-            fileBuffer.reactiveItem.url = url;
-            fileBuffer.reactiveItem.progress = 100; // Ensure final progress is 100
-          }
-          console.log(`[${mySessionId.value}] 文件 ${fileBuffer.metadata.fileName} 重组完成，可下载。`);
-          // It's crucial to delete the buffer ONLY after the Blob is created AND URL is set
-          // We will delete it when `file-transfer-complete-signal` is received
-          // For now, keep it for final check if complete signal is lost or delayed
-        }
-      }
-    } catch (e) {
-      console.error(`[${mySessionId.value}] 处理DataChannel消息出错 (来自 ${peerId}): ${e.message}`, e);
-      fileTransferError.value = `接收文件错误: ${e.message}`;
-    }
-  };
-};
-
 // Function to concatenate an array of ArrayBuffers (handling sparse arrays for potential missing chunks)
 const concatenateArrayBuffers = (buffers) => {
   let totalLength = 0;
@@ -603,119 +772,6 @@ const handleFileChange = (event) => {
   console.log(`[${mySessionId.value}] 文件已选择: ${selectedFile.value ? selectedFile.value.name : '无'}`);
 };
 
-const sendFileBroadcast = async () => {
-  console.log(`[${mySessionId.value}] sendFileBroadcast called.`);
-  console.log(`[${mySessionId.value}] selectedFile.value:`, selectedFile.value);
-
-  const activePeerIds = Object.keys(peerConnections).filter(peerId =>
-    peerConnections[peerId].dc && peerConnections[peerId].dc.readyState === 'open'
-  );
-
-  console.log(`[${mySessionId.value}] 活跃 DataChannels (${activePeerIds.length}个):`, activePeerIds);
-
-  if (activePeerIds.length === 0) {
-    fileTransferError.value = '没有活跃的 Data Channel 可用于广播。请等待对等端连接。';
-    console.error(`[${mySessionId.value}] No active DataChannels to broadcast.`);
-    return;
-  }
-  if (!selectedFile.value) {
-    fileTransferError.value = '未选择文件。';
-    console.error(`[${mySessionId.value}] No file selected.`);
-    return;
-  }
-
-  fileTransferError.value = ''; // Clear previous error
-  sendFileProgress.value = 0; // Reset global progress
-
-  const fileToBroadcast = selectedFile.value;
-  const transferPromises = activePeerIds.map(peerId =>
-    sendFileToPeer(peerId, fileToBroadcast)
-  );
-
-  // Monitor all transfers to update a consolidated progress or handle overall completion/failure
-  Promise.all(transferPromises).then(() => {
-    console.log(`[${mySessionId.value}] 所有文件传输完成 (广播)。`);
-    sendFileProgress.value = 100;
-    // Clear selected file after all transfers are theoretically complete
-    selectedFile.value = null;
-    if (document.querySelector('input[type="file"]')) {
-      document.querySelector('input[type="file"]').value = '';
-    }
-  }).catch(error => {
-    console.error(`[${mySessionId.value}] 广播文件传输中存在错误:`, error);
-    fileTransferError.value = `文件广播失败：${error.message}`;
-  });
-
-  // A more complex global progress update would involve tracking bytes sent across all peers,
-  // but for simplicity, we keep the single `sendFileProgress` updated by the currently sending chunk.
-};
-
-const sendFileToPeer = async (targetPeerId, file) => {
-  const pcInfo = peerConnections[targetPeerId];
-  if (!pcInfo) {
-    console.warn(`[${mySessionId.value}] No pcInfo for ${targetPeerId}. Peer connection might not be established.`);
-    return Promise.reject(new Error(`No peer connection info for ${targetPeerId}`));
-  }
-
-  // Ensure fileQueue is always initialized for each peer
-  if (!pcInfo.fileQueue) {
-      pcInfo.fileQueue = [];
-  }
-
-  const fileId = `${mySessionId.value}-${Date.now()}-${file.name}`;
-  const fileTransferState = {
-    file: file,
-    fileId: fileId,
-    offset: 0,
-    reader: new FileReader(),
-    isSending: false, // Flag to indicate if this specific transfer is actively sending chunks
-    targetPeerId: targetPeerId,
-    resolve: null,
-    reject: null
-  };
-
-  // Add the new file transfer to the queue
-  pcInfo.fileQueue.push(fileTransferState);
-  console.log(`[${mySessionId.value}] 文件 ${file.name} (ID: ${fileId}) 添加到队列 for ${targetPeerId}. 当前队列长度: ${pcInfo.fileQueue.length}`);
-
-  // Send metadata immediately if DataChannel is open
-  const dc = pcInfo.dc;
-  if (dc && dc.readyState === 'open') {
-    const metadata = {
-      type: 'file-metadata-signal',
-      fileId: fileId,
-      fileName: file.name,
-      fileType: file.type || 'application/octet-stream',
-      fileSize: file.size,
-      from: mySessionId.value
-    };
-    const metadataPayload = JSON.stringify(metadata);
-    try {
-      dc.send(metadataPayload);
-      console.log(`[${mySessionId.value}] 发送元数据 for ${fileId} 给 ${targetPeerId}.`);
-    } catch (e) {
-      console.error(`[${mySessionId.value}] 无法通过 DataChannel 发送元数据 for ${fileId} 给 ${targetPeerId}: ${e.message}`);
-      fileTransferError.value = `无法发送元数据给 ${targetPeerId}: ${e.message}`;
-      // Remove from queue and reject if metadata fails
-      pcInfo.fileQueue = pcInfo.fileQueue.filter(f => f.fileId !== fileId);
-      return Promise.reject(e);
-    }
-
-    // If this is the *first* file in the queue, and DC is open, start sending chunks
-    if (pcInfo.fileQueue[0] === fileTransferState && dc.bufferedAmount === 0) {
-      console.log(`[${mySessionId.value}] 为 ${fileId} 启动初始块传输给 ${targetPeerId}.`);
-      fileTransferState.isSending = true; // Mark as actively sending
-      readNextChunk(fileTransferState);
-    }
-  } else {
-    console.warn(`[${mySessionId.value}] DataChannel to ${targetPeerId} 未打开或未准备好。元数据将等待DC打开后发送，块将排队等待。`);
-  }
-
-  return new Promise((resolve, reject) => {
-    fileTransferState.resolve = resolve;
-    fileTransferState.reject = reject;
-  });
-};
 
 const readNextChunk = (fileTransferState) => {
   const { file, offset, reader, fileId, targetPeerId } = fileTransferState;
@@ -871,6 +927,45 @@ const readNextChunk = (fileTransferState) => {
     }
   };
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 onMounted(() => {
