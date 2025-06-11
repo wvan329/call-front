@@ -9,6 +9,8 @@ const peers = ref({})
 const selfId = ref('')
 const onlineUsers = ref([])
 const file = ref(null)
+const receivedFiles = ref([])  // 每项：{ name, url, size }
+
 
 function handleFileChange(e) {
   file.value = e.target.files[0]
@@ -85,13 +87,17 @@ async function sendFile() {
           await new Promise(res => setTimeout(res, 10))
         } else {
           dc.send(value)
-          ;({ value, done } = await reader.read())
+            ; ({ value, done } = await reader.read())
         }
       }
       dc.send('EOF')
     }
 
-    dc.onopen = () => sendChunks()
+    dc.onopen = () => {
+      // 先发送文件名等信息
+      dc.send(JSON.stringify({ type: 'meta', filename: file.value.name }))
+      sendChunks()
+    }
   }
 }
 
@@ -129,18 +135,36 @@ async function handleOffer(msg) {
 
 function setupReceiverDataChannel(dc) {
   const chunks = []
+  let filename = 'received_' + Date.now()
+
   dc.onmessage = (e) => {
-    if (e.data === 'EOF') {
-      const blob = new Blob(chunks)
-      const a = document.createElement('a')
-      a.href = URL.createObjectURL(blob)
-      a.download = 'received_' + Date.now()
-      a.click()
-    } else {
-      chunks.push(e.data)
+    if (typeof e.data === 'string') {
+      try {
+        const msg = JSON.parse(e.data)
+        if (msg.type === 'meta' && msg.filename) {
+          filename = msg.filename
+          return
+        }
+      } catch {
+        if (e.data === 'EOF') {
+          const blob = new Blob(chunks)
+          const url = URL.createObjectURL(blob)
+          receivedFiles.value.push({
+            name: filename,
+            url,
+            size: blob.size
+          })
+        }
+        return
+      }
     }
+
+    // binary chunk
+    chunks.push(e.data)
   }
 }
+
+
 </script>
 
 <template>
@@ -148,5 +172,15 @@ function setupReceiverDataChannel(dc) {
     <input type="file" @change="handleFileChange" />
     <button @click="sendFile" class="px-4 py-2 bg-blue-600 text-white rounded">发送文件</button>
     <p>在线用户：{{ onlineUsers }}</p>
+  </div>
+  <div class="mt-4">
+    <h3 class="font-bold">已接收文件：</h3>
+    <ul class="space-y-2">
+      <li v-for="file in receivedFiles" :key="file.url">
+        <a :href="file.url" :download="file.name" class="text-blue-600 underline">
+          {{ file.name }} ({{ (file.size / 1024).toFixed(1) }} KB)
+        </a>
+      </li>
+    </ul>
   </div>
 </template>
