@@ -80,7 +80,7 @@ const RTC_CONFIG = {
 
 // --- File Transfer Constants ---
 const CHUNK_SIZE = 16 * 1024; // 16KB per chunk
-const MAX_BUFFERED_AMOUNT = 1 * 1024 * 1024; // 1MB, increased for better throughput, adjust as needed
+const MAX_BUFFERED_AMOUNT = 50 * 1024 * 1024; // 1MB, increased for better throughput, adjust as needed
 
 // Your WebSocket signaling server URL
 const wsUrl = 'ws://59.110.35.198/wgk/ws/file';
