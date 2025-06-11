@@ -10,6 +10,10 @@ const selfId = ref('')
 const onlineUsers = ref([])
 const file = ref(null)
 
+function handleFileChange(e) {
+  file.value = e.target.files[0]
+}
+
 onMounted(() => {
   ws.value = new WebSocket(WS_URL)
 
@@ -141,7 +145,7 @@ function setupReceiverDataChannel(dc) {
 
 <template>
   <div class="p-4 space-y-4">
-    <input type="file" @change="e => file.value = e.target.files[0]" />
+    <input type="file" @change="handleFileChange" />
     <button @click="sendFile" class="px-4 py-2 bg-blue-600 text-white rounded">发送文件</button>
     <p>在线用户：{{ onlineUsers }}</p>
   </div>
