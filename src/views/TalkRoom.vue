@@ -66,40 +66,12 @@ let audioContext, analyser, microphone, javascriptNode;
 // --- WebRTC 配置 ---
 const pc_config = {
   iceServers: [
-    // 主要 Google STUN 服务器
-    { urls: [
-      'stun:stun.l.google.com:19302',
-      'stun:stun1.l.google.com:19302',
-      'stun:stun2.l.google.com:19302',
-      'stun:stun3.l.google.com:19302',
-      'stun:stun4.l.google.com:19302'
-    ]},
-    
-    // 备用公共 STUN 服务器
-    { urls: [
-      'stun:stun.stunprotocol.org:3478',
-      'stun:stun.voipbuster.com:3478',
-      'stun:stun.sipgate.net:3478',
-      'stun:stun.ekiga.net:3478',
-      'stun:stun.services.mozilla.com:3478'
-    ]},
-    
-    // 您自己的 TURN 服务器（强烈建议设置）
     {
-      urls: 'turn:your-turn-server.com:3478',
-      username: 'your-username',
-      credential: 'your-password'
-    },
-    
-    // 备用 TURN 服务器
-    {
-      urls: 'turn:numb.viagenie.ca:3478',
-      username: 'your-username',
-      credential: 'your-password'
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
     }
-  ],
-  iceTransportPolicy: 'all', // 或 relay 如果只需要 TURN
-  iceCandidatePoolSize: 5
+  ]
 };
 
 // --- WebSocket 核心功能 ---
@@ -311,28 +283,28 @@ const toggleMute = () => {
 };
 
 const setupSpeechDetection = () => {
-    // setupSpeechDetection 逻辑与之前版本相同
-    if (!localStream.value || !localStream.value.getAudioTracks().length) return;
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    analyser = audioContext.createAnalyser();
-    microphone = audioContext.createMediaStreamSource(localStream.value);
-    javascriptNode = audioContext.createScriptProcessor(512, 1, 1);
-    analyser.smoothingTimeConstant = 0.7;
-    analyser.fftSize = 2048;
-    microphone.connect(analyser);
-    analyser.connect(javascriptNode);
-    javascriptNode.connect(audioContext.destination);
-    javascriptNode.onaudioprocess = () => {
-        const array = new Uint8Array(analyser.frequencyBinCount);
-        analyser.getByteFrequencyData(array);
-        let values = 0;
-        const length = array.length;
-        for (let i = 0; i < length; i++) {
-            values += (array[i]);
-        }
-        const average = values / length;
-        isSpeaking.value = average > 15; 
-    };
+  // setupSpeechDetection 逻辑与之前版本相同
+  if (!localStream.value || !localStream.value.getAudioTracks().length) return;
+  audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  analyser = audioContext.createAnalyser();
+  microphone = audioContext.createMediaStreamSource(localStream.value);
+  javascriptNode = audioContext.createScriptProcessor(512, 1, 1);
+  analyser.smoothingTimeConstant = 0.7;
+  analyser.fftSize = 2048;
+  microphone.connect(analyser);
+  analyser.connect(javascriptNode);
+  javascriptNode.connect(audioContext.destination);
+  javascriptNode.onaudioprocess = () => {
+    const array = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(array);
+    let values = 0;
+    const length = array.length;
+    for (let i = 0; i < length; i++) {
+      values += (array[i]);
+    }
+    const average = values / length;
+    isSpeaking.value = average > 15;
+  };
 };
 
 
