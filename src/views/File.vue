@@ -23,10 +23,10 @@
           <p>
             <span class="file-info">{{ file.metadata.fileName }}({{ formatBytes(file.metadata.fileSize) }})</span>
             <a :href="file.url" :download="file.metadata.fileName" class="download-link">Download</a>
-            <div v-if="file.progress < 100" class="progress-bar-container">
-              <div class="progress-bar" :style="{ width: file.progress + '%' }"></div>
-              <span>{{ file.progress.toFixed(1) }}%</span>
-            </div>
+          <div v-if="file.progress < 100" class="progress-bar-container">
+            <div class="progress-bar" :style="{ width: file.progress + '%' }"></div>
+            <span>{{ file.progress.toFixed(1) }}%</span>
+          </div>
           </p>
         </li>
       </ul>
@@ -55,13 +55,15 @@ const incomingFileBuffers = {};
 
 // --- WebRTC Configuration ---
 const RTC_CONFIG = {
-iceServers: [
-  {
-    urls: 'turn:openrelay.metered.ca:80',
-    username: 'openrelayproject',
-    credential: 'openrelayproject'
-  }
-]
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun.flashdance.cx:3478' },
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ]
 };
 
 // --- File Transfer Constants ---
@@ -87,19 +89,19 @@ const formatBytes = (bytes, decimals = 2) => {
 
 
 
-  // --- 新增心跳函数 ---
-  const startHeartbeat = () => {
-    console.log('启动心跳机制...');
-    heartbeatIntervalId.value = setInterval(() => {
-      if (ws.value && ws.value.readyState === WebSocket.OPEN) {
-        // 发送 ping 消息
-        sendMessage({ type: 'ping' });
-      }
-    }, 30000); // 每 30 秒发送一次
-  };
+// --- 新增心跳函数 ---
+const startHeartbeat = () => {
+  console.log('启动心跳机制...');
+  heartbeatIntervalId.value = setInterval(() => {
+    if (ws.value && ws.value.readyState === WebSocket.OPEN) {
+      // 发送 ping 消息
+      sendMessage({ type: 'ping' });
+    }
+  }, 30000); // 每 30 秒发送一次
+};
 
 
-  const sendMessage = (message) => {
+const sendMessage = (message) => {
   if (ws.value && ws.value.readyState === WebSocket.OPEN) {
     ws.value.send(JSON.stringify(message));
   } else {
@@ -107,20 +109,20 @@ const formatBytes = (bytes, decimals = 2) => {
   }
 };
 
-    const stopHeartbeat = () => {
-    console.log('停止心跳机制...');
-    if (heartbeatIntervalId.value) {
-      clearInterval(heartbeatIntervalId.value);
-      heartbeatIntervalId.value = null;
-    }
-  };
+const stopHeartbeat = () => {
+  console.log('停止心跳机制...');
+  if (heartbeatIntervalId.value) {
+    clearInterval(heartbeatIntervalId.value);
+    heartbeatIntervalId.value = null;
+  }
+};
 
 // --- WebSocket Signaling Logic ---
 const connectWebSocket = () => {
   ws.value = new WebSocket(wsUrl);
 
   ws.value.onopen = () => {
-    startHeartbeat(); 
+    startHeartbeat();
     isWsConnected.value = true;
     // Periodically send ping to keep connection alive
     setInterval(() => {
@@ -152,7 +154,7 @@ const connectWebSocket = () => {
         onlinePeers.forEach(peerId => {
           if (!currentConnectedPeers.includes(peerId) && !peerConnections[peerId]) {
             if (mySessionId.value < peerId) {
-                createOffer(peerId);
+              createOffer(peerId);
             }
           }
         });
@@ -202,9 +204,9 @@ const connectWebSocket = () => {
 // --- WebRTC Peer Connection Logic ---
 const createPeerConnection = (targetPeerId, isOfferer = true) => {
   if (peerConnections[targetPeerId] && peerConnections[targetPeerId].pc &&
-      peerConnections[targetPeerId].pc.connectionState !== 'closed' &&
-      peerConnections[targetPeerId].pc.iceConnectionState !== 'failed' &&
-      peerConnections[targetPeerId].pc.iceConnectionState !== 'disconnected') {
+    peerConnections[targetPeerId].pc.connectionState !== 'closed' &&
+    peerConnections[targetPeerId].pc.iceConnectionState !== 'failed' &&
+    peerConnections[targetPeerId].pc.iceConnectionState !== 'disconnected') {
     return peerConnections[targetPeerId].pc;
   }
 
@@ -228,9 +230,9 @@ const createPeerConnection = (targetPeerId, isOfferer = true) => {
   };
 
   pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
-          closePeerConnection(targetPeerId);
-      }
+    if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+      closePeerConnection(targetPeerId);
+    }
   };
 
   pc.ondatachannel = (event) => {
@@ -256,7 +258,7 @@ const setupDataChannelListeners = (channel, peerId) => {
 
   channel.onclose = () => {
     if (peerConnections[peerId]) {
-        peerConnections[peerId].dc = null;
+      peerConnections[peerId].dc = null;
     }
   };
 
@@ -306,7 +308,7 @@ const setupDataChannelListeners = (channel, peerId) => {
 
         const reactiveFileItem = receivedFiles.find(item => item.index === fileBuffer.index);
         if (reactiveFileItem) {
-            reactiveFileItem.progress = fileBuffer.progress;
+          reactiveFileItem.progress = fileBuffer.progress;
         }
 
         if (isLastChunk) {
@@ -315,8 +317,8 @@ const setupDataChannelListeners = (channel, peerId) => {
           const url = URL.createObjectURL(blob);
 
           if (reactiveFileItem) {
-              reactiveFileItem.url = url;
-              reactiveFileItem.progress = 100;
+            reactiveFileItem.url = url;
+            reactiveFileItem.progress = 100;
           }
 
           delete incomingFileBuffers[fileId];
@@ -329,22 +331,22 @@ const setupDataChannelListeners = (channel, peerId) => {
 };
 
 const concatenateArrayBuffers = (buffers) => {
-    let totalLength = 0;
-    for (const buffer of buffers) {
-        if (buffer) {
-            totalLength += buffer.byteLength;
-        }
+  let totalLength = 0;
+  for (const buffer of buffers) {
+    if (buffer) {
+      totalLength += buffer.byteLength;
     }
+  }
 
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const buffer of buffers) {
-        if (buffer) {
-            result.set(new Uint8Array(buffer), offset);
-            offset += buffer.byteLength;
-        }
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const buffer of buffers) {
+    if (buffer) {
+      result.set(new Uint8Array(buffer), offset);
+      offset += buffer.byteLength;
     }
-    return result.buffer;
+  }
+  return result.buffer;
 };
 
 const closePeerConnection = (peerId) => {
@@ -363,22 +365,22 @@ const closePeerConnection = (peerId) => {
 
 // --- WebRTC Signaling Message Handlers (Send to signaling server) ---
 const sendSignalingMessage = (type, payload, toId) => {
-    if (ws.value && ws.value.readyState === WebSocket.OPEN && toId) {
-        const message = {
-            type: type,
-            to: toId,
-            ...payload
-        };
-        ws.value.send(JSON.stringify(message));
-    } else {
-        // console.error(`Cannot send signaling message to ${toId}: WS not open or missing target for ${type}`); // Removed for production, kept for potential silent debugging
-    }
+  if (ws.value && ws.value.readyState === WebSocket.OPEN && toId) {
+    const message = {
+      type: type,
+      to: toId,
+      ...payload
+    };
+    ws.value.send(JSON.stringify(message));
+  } else {
+    // console.error(`Cannot send signaling message to ${toId}: WS not open or missing target for ${type}`); // Removed for production, kept for potential silent debugging
+  }
 };
 
 const createOffer = async (targetPeerId) => {
   if (peerConnections[targetPeerId] && peerConnections[targetPeerId].pc &&
-      peerConnections[targetPeerId].pc.localDescription && peerConnections[targetPeerId].pc.localDescription.type === 'offer') {
-      return;
+    peerConnections[targetPeerId].pc.localDescription && peerConnections[targetPeerId].pc.localDescription.type === 'offer') {
+    return;
   }
 
   const pc = createPeerConnection(targetPeerId, true);
@@ -410,7 +412,7 @@ const handleAnswer = async (sdp, fromId) => {
   }
   try {
     if (pcInfo.pc.signalingState !== 'have-local-offer') {
-        // console.warn(`[${fromId}] Received answer while in state ${pcInfo.pc.signalingState}. Expected 'have-local-offer'.`); // Removed for production, kept for potential silent debugging
+      // console.warn(`[${fromId}] Received answer while in state ${pcInfo.pc.signalingState}. Expected 'have-local-offer'.`); // Removed for production, kept for potential silent debugging
     }
     await pcInfo.pc.setRemoteDescription(new RTCSessionDescription(sdp));
   } catch (error) {
@@ -498,11 +500,11 @@ const sendFileBroadcast = async () => {
     combinedBuffer.set(new Uint8Array(chunk), header.byteLength);
 
     activeDataChannels.forEach(dc => {
-        try {
-            dc.send(combinedBuffer.buffer);
-        } catch (e) {
-            // console.error(`Failed to send file chunk via data channel: ${e.message}`); // Removed for production, kept for potential silent debugging
-        }
+      try {
+        dc.send(combinedBuffer.buffer);
+      } catch (e) {
+        // console.error(`Failed to send file chunk via data channel: ${e.message}`); // Removed for production, kept for potential silent debugging
+      }
     });
 
     offset += chunk.byteLength;
@@ -518,11 +520,11 @@ const sendFileBroadcast = async () => {
         from: mySessionId.value
       });
       activeDataChannels.forEach(dc => {
-          try {
-              dc.send(completeSignalPayload);
-          } catch (e) {
-              // console.error(`Failed to send completion signal via data channel: ${e.message}`); // Removed for production, kept for potential silent debugging
-          }
+        try {
+          dc.send(completeSignalPayload);
+        } catch (e) {
+          // console.error(`Failed to send completion signal via data channel: ${e.message}`); // Removed for production, kept for potential silent debugging
+        }
       });
 
       selectedFile.value = null;
@@ -600,7 +602,8 @@ h3 {
   color: #388e3c;
 }
 
-.my-id, .connected-peers-count {
+.my-id,
+.connected-peers-count {
   font-weight: bold;
   color: #1b5e20;
 }
@@ -684,14 +687,14 @@ h3 {
 }
 
 .progress-bar-container span {
-    position: absolute;
-    width: 100%;
-    text-align: center;
-    line-height: 25px;
-    color: #333;
-    font-size: 0.9em;
-    font-weight: bold;
-    text-shadow: 0 0 2px rgba(255,255,255,0.7);
+  position: absolute;
+  width: 100%;
+  text-align: center;
+  line-height: 25px;
+  color: #333;
+  font-size: 0.9em;
+  font-weight: bold;
+  text-shadow: 0 0 2px rgba(255, 255, 255, 0.7);
 }
 
 .received-files-section {
