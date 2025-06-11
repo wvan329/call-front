@@ -10,7 +10,10 @@ const selfId = ref('')
 const onlineUsers = ref([])
 const file = ref(null)
 const receivedFiles = ref([])  // 每项：{ name, url, size }
-
+const sendProgress = ref(0)  // 发送进度百分比 0~100
+const receiveProgress = ref(0)  // 接收进度百分比 0~100
+let fileSize = 0
+let receivedSize = 0
 
 function handleFileChange(e) {
   file.value = e.target.files[0]
@@ -50,57 +53,6 @@ onMounted(() => {
   }
 })
 
-async function sendFile() {
-  if (!file.value) return
-
-  for (const userId of onlineUsers.value) {
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
-    const dc = pc.createDataChannel('file')
-    const pendingCandidates = []
-
-    peers.value[userId] = { pc, dc, pendingCandidates }
-
-    setupReceiverDataChannel(dc)
-
-    pc.onicecandidate = ({ candidate }) => {
-      if (candidate) {
-        ws.value.send(JSON.stringify({ type: 'candidate', to: userId, candidate }))
-      }
-    }
-
-    const offer = await pc.createOffer()
-    await pc.setLocalDescription(offer)
-
-    ws.value.send(JSON.stringify({
-      type: 'offer',
-      to: userId,
-      desc: pc.localDescription // 传的是对象，不用手动 stringify
-    }))
-
-    const reader = file.value.stream().getReader()
-    const MAX_BUFFER = 16 * 1024 * 1024
-
-    async function sendChunks() {
-      let { value, done } = await reader.read()
-      while (!done) {
-        if (dc.bufferedAmount > MAX_BUFFER) {
-          await new Promise(res => setTimeout(res, 10))
-        } else {
-          dc.send(value)
-            ; ({ value, done } = await reader.read())
-        }
-      }
-      dc.send('EOF')
-    }
-
-    dc.onopen = () => {
-      // 先发送文件名等信息
-      dc.send(JSON.stringify({ type: 'meta', filename: file.value.name }))
-      sendChunks()
-    }
-  }
-}
-
 async function handleOffer(msg) {
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
   const pendingCandidates = []
@@ -133,37 +85,96 @@ async function handleOffer(msg) {
   }))
 }
 
+
 function setupReceiverDataChannel(dc) {
   const chunks = []
   let filename = 'received_' + Date.now()
+  receivedSize = 0
+  receiveProgress.value = 0
 
   dc.onmessage = (e) => {
     if (typeof e.data === 'string') {
       try {
         const msg = JSON.parse(e.data)
-        if (msg.type === 'meta' && msg.filename) {
+        if (msg.type === 'meta' && msg.filename && msg.size) {
           filename = msg.filename
+          fileSize = msg.size
+          receiveProgress.value = 0
           return
         }
       } catch {
         if (e.data === 'EOF') {
           const blob = new Blob(chunks)
           const url = URL.createObjectURL(blob)
-          receivedFiles.value.push({
-            name: filename,
-            url,
-            size: blob.size
-          })
+          receivedFiles.value.push({ name: filename, url, size: blob.size })
+          receiveProgress.value = 100
         }
         return
       }
+    } else {
+      chunks.push(e.data)
+      receivedSize += e.data.byteLength || e.data.length
+      receiveProgress.value = Math.min(100, Math.floor((receivedSize / fileSize) * 100))
     }
-
-    // binary chunk
-    chunks.push(e.data)
   }
 }
 
+async function sendFile() {
+  if (!file.value) return
+
+  fileSize = file.value.size
+  sendProgress.value = 0
+
+  for (const userId of onlineUsers.value) {
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+    const dc = pc.createDataChannel('file')
+    const pendingCandidates = []
+    peers.value[userId] = { pc, dc, pendingCandidates }
+    setupReceiverDataChannel(dc)
+
+    pc.onicecandidate = ({ candidate }) => {
+      if (candidate) {
+        ws.value.send(JSON.stringify({ type: 'candidate', to: userId, candidate }))
+      }
+    }
+
+    const offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+
+    ws.value.send(JSON.stringify({
+      type: 'offer',
+      to: userId,
+      desc: pc.localDescription
+    }))
+
+    const reader = file.value.stream().getReader()
+    const MAX_BUFFER = 16 * 1024 * 1024
+    let sentSize = 0
+
+    dc.onopen = async () => {
+      // 先发元信息：文件名+大小
+      dc.send(JSON.stringify({ type: 'meta', filename: file.value.name, size: fileSize }))
+
+      async function sendChunks() {
+        let { value, done } = await reader.read()
+        while (!done) {
+          if (dc.bufferedAmount > MAX_BUFFER) {
+            await new Promise(res => setTimeout(res, 10))
+          } else {
+            dc.send(value)
+            sentSize += value.byteLength || value.length
+            sendProgress.value = Math.min(100, Math.floor((sentSize / fileSize) * 100))
+            ;({ value, done } = await reader.read())
+          }
+        }
+        dc.send('EOF')
+        sendProgress.value = 100
+      }
+
+      sendChunks()
+    }
+  }
+}
 
 </script>
 
