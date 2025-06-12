@@ -1,6 +1,6 @@
 <template>
   <div id="app">
-    <h1>大文件点对点传输</h1>
+    <h1>大文件传输</h1>
 
     <input type="file" @change="onFileChange" />
     <button @click="startTransfer" :disabled="!file">开始传输</button>
@@ -158,7 +158,9 @@ function sendFile(file) {
     const now = Date.now()
     const timeDiff = (now - lastTime) / 1000
     const byteDiff = sentBytes - lastBytes
-    speed.value = (byteDiff / timeDiff / 1024 / 1024).toFixed(2) + ' MB/s'
+    if (timeDiff > 0) {
+      speed.value = (byteDiff / timeDiff / 1024 / 1024).toFixed(2) + ' MB/s'
+    }
     lastTime = now
     lastBytes = sentBytes
     progress.value = ((sentBytes / totalSize) * 100).toFixed(2)
