@@ -121,8 +121,6 @@ function setupWebSocket() {
   ws.onmessage = async (event) => {
     const msg = JSON.parse(event.data)
 
-    if (msg.type === 'pong') return // 心跳响应
-
     // 原处理逻辑：
     if (msg.type === 'offer') {
       pc = new RTCPeerConnection({
