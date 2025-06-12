@@ -2,6 +2,11 @@
   <div class="webrtc-file-transfer-container">
     <h2>WebRTC 文件传输</h2>
 
+    <div class="connection-status">
+      <span :class="wsStatus.class">WebSocket: {{ wsStatus.text }}</span>
+      <span class="peers-count">活跃连接: {{ activePeersCount }}</span>
+    </div>
+
     <div class="file-transfer-section">
       <h3>文件发送</h3>
       <input type="file" @change="handleFileSelection" ref="fileInput" />
@@ -10,7 +15,7 @@
       </button>
       <div v-if="selectedFile" class="file-info">
         <p>已选文件: {{ selectedFile.name }} ({{ formatBytes(selectedFile.size) }})</p>
-        <p>基础分块大小: {{ formatBytes(BASE_CHUNK_SIZE) }}</p>
+        <p>传输参数: 块大小 {{ formatBytes(currentChunkSize) }} | 缓冲区 {{ formatBytes(currentBufferLimit) }}</p>
       </div>
       <div class="progress-container" v-if="selectedFile">
         <div class="progress-bar" :style="{ width: sendProgress + '%' }"></div>
@@ -18,11 +23,6 @@
         <span class="speed-indicator">{{ formatSpeed(currentSendSpeed) }}/s</span>
       </div>
       <p v-if="errorMessage" class="error-message">{{ errorMessage }}</p>
-      <!-- <div v-if="transferStats.enabled" class="transfer-stats">
-        <p>重传次数: {{ transferStats.retransmissions }}</p>
-        <p>丢包率: {{ (transferStats.packetLossRate * 100).toFixed(2) }}%</p>
-        <p>平均RTT: {{ transferStats.averageRTT }}ms</p>
-      </div> -->
     </div>
 
     <div class="received-files-section">
@@ -32,98 +32,78 @@
           <div class="file-header">
             <span class="file-name">{{ file.name }}</span>
             <span class="file-size">{{ formatBytes(file.size) }}</span>
-            <a v-if="file.progress === 100" :href="file.url" :download="file.name" class="download-btn">下载</a>
+            <a v-if="file.progress === 100" :href="file.url" :download="file.name" class="download-btn">
+              <i class="fa fa-download"></i> 下载
+            </a>
           </div>
           <div class="file-progress">
             <div class="progress-bar" :style="{ width: file.progress + '%' }"></div>
-            <span class="progress-text">{{ file.progress.toFixed(2) }}%</span>
+            <span class="progress-text">{{ file.progress.toFixed(1) }}%</span>
           </div>
+          <p v-if="file.error" class="file-error">{{ file.error }}</p>
         </div>
       </div>
-      <!-- <p v-else class="empty-message">暂无接收文件</p> -->
+      <p v-else class="empty-message">暂无接收文件</p>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, computed, onMounted, onUnmounted, watchEffect } from 'vue';
+import { sha256 } from 'js-sha256';
 
-// --- Enhanced Configuration Constants ---
+// --- 配置常量 ---
 const WS_URL = 'ws://59.110.35.198/wgk/ws/file';
 const ICE_SERVERS = [{ urls: 'stun:59.110.35.198:3478' }];
-const BASE_CHUNK_SIZE = 32 * 1024; // Start with 32KB chunks
-const MIN_CHUNK_SIZE = 8 * 1024;   // Minimum 8KB
-const MAX_CHUNK_SIZE = 256 * 1024; // Maximum 256KB
-const INITIAL_BUFFER_LIMIT = 4 * 1024 * 1024; // Start with 4MB buffer
-const MIN_BUFFER_LIMIT = 1 * 1024 * 1024;     // Minimum 1MB
-const MAX_BUFFER_LIMIT = 32 * 1024 * 1024;    // Maximum 32MB
-const RETRANSMIT_TIMEOUT = 3000;
-const MAX_RETRANSMITS = 50;
-const HEARTBEAT_INTERVAL = 25000;
-const UI_UPDATE_INTERVAL = 200;
-const CONGESTION_DETECTION_WINDOW = 10; // Monitor last 10 chunks for congestion
-const ADAPTIVE_ADJUSTMENT_INTERVAL = 1000; // Adjust parameters every second
 
-// --- Reactive State ---
+// 传输参数
+const INITIAL_CHUNK_SIZE = 64 * 1024;  // 初始块大小 64KB
+const MIN_CHUNK_SIZE = 8 * 1024;       // 最小块大小 8KB
+const MAX_CHUNK_SIZE = 512 * 1024;     // 最大块大小 512KB
+const INITIAL_BUFFER_LIMIT = 8 * 1024 * 1024; // 初始缓冲区限制 8MB
+const MIN_BUFFER_LIMIT = 2 * 1024 * 1024;     // 最小缓冲区限制 2MB
+const MAX_BUFFER_LIMIT = 64 * 1024 * 1024;    // 最大缓冲区限制 64MB
+
+// 超时设置
+const ACK_TIMEOUT = 5000;              // ACK超时时间(毫秒)
+const MAX_RETRIES = 10;                // 最大重试次数
+const HEARTBEAT_INTERVAL = 25000;      // WebSocket心跳间隔
+const CONNECTION_TIMEOUT = 30000;      // 连接超时时间
+
+// 自适应控制
+const ADAPTIVE_INTERVAL = 1000;        // 自适应参数调整间隔(毫秒)
+const CONGESTION_THRESHOLD = 0.7;      // 拥塞阈值
+const UI_UPDATE_INTERVAL = 200;        // UI更新间隔(毫秒)
+
+// --- 状态管理 ---
 const ws = ref(null);
 const mySessionId = ref('');
 const selectedFile = ref(null);
 const errorMessage = ref('');
 const isTransferring = ref(false);
 
-// Enhanced peer connection management
+// 对等连接管理
 const peerConnections = reactive({});
+
+// 传输状态
 const outgoingTransfers = reactive({});
 const incomingFiles = reactive({});
+const receivedFiles = reactive([]);
 
-// Enhanced performance tracking
+// 性能指标
 const totalBytesSent = ref(0);
 const lastSpeedCalcTime = ref(0);
 const lastBytesSentForSpeed = ref(0);
 const currentSendSpeed = ref(0);
 const sendProgress = ref(0);
-const receivedFiles = reactive([]);
 
-// Adaptive rate control
-const adaptiveInfo = reactive({
-  enabled: false,
-  currentChunkSize: BASE_CHUNK_SIZE,
-  currentBufferLimit: INITIAL_BUFFER_LIMIT,
-  congestionRate: 0,
-  recentSendTimes: [],
-  recentBufferFullEvents: 0,
-  lastAdjustmentTime: 0
-});
+// 自适应传输参数
+const currentChunkSize = ref(INITIAL_CHUNK_SIZE);
+const currentBufferLimit = ref(INITIAL_BUFFER_LIMIT);
+const congestionRate = ref(0);
+const recentBufferFullEvents = ref(0);
 
-// Transfer statistics
-const transferStats = reactive({
-  enabled: false,
-  retransmissions: 0,
-  totalPacketsSent: 0,
-  packetLossRate: 0,
-  rttMeasurements: [],
-  averageRTT: 0
-});
-
-// --- Computed Properties ---
-const wsStatus = computed(() => {
-  if (!ws.value) return { class: 'disconnected', text: '未连接' };
-  switch (ws.value.readyState) {
-    case WebSocket.OPEN: return { class: 'connected', text: '已连接' };
-    case WebSocket.CONNECTING: return { class: 'connecting', text: '连接中' };
-    case WebSocket.CLOSING: return { class: 'disconnected', text: '关闭中' };
-    case WebSocket.CLOSED: return { class: 'disconnected', text: '已断开' };
-    default: return { class: 'disconnected', text: '未知' };
-  }
-});
-
-const activePeersCount = computed(() => {
-  return Object.values(peerConnections).filter(pc =>
-    pc.status === 'connected' && pc.dataChannel?.readyState === 'open'
-  ).length;
-});
-
-// --- Enhanced Utility Functions ---
+// --- 工具函数 ---
 const formatBytes = (bytes, decimals = 2) => {
   if (bytes === 0) return '0 Bytes';
   const k = 1024;
@@ -133,42 +113,49 @@ const formatBytes = (bytes, decimals = 2) => {
 };
 
 const formatSpeed = (bytes) => {
-  return formatBytes(bytes);
+  return formatBytes(bytes) + '/s';
 };
 
 const generateUniqueId = () => {
   return `${mySessionId.value}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 };
 
-// --- Adaptive Rate Control Functions ---
-const updateCongestionMetrics = (sendTime, wasBufferFull) => {
-  const now = Date.now();
-  adaptiveInfo.recentSendTimes.push({ time: now, sendTime });
-
-  if (wasBufferFull) {
-    adaptiveInfo.recentBufferFullEvents++;
-  }
-
-  // Keep only recent data (last 10 seconds)
-  const cutoffTime = now - 10000;
-  adaptiveInfo.recentSendTimes = adaptiveInfo.recentSendTimes.filter(entry => entry.time > cutoffTime);
-
-  // Calculate congestion rate
-  if (adaptiveInfo.recentSendTimes.length > 0) {
-    const bufferFullRate = adaptiveInfo.recentBufferFullEvents / adaptiveInfo.recentSendTimes.length;
-    adaptiveInfo.congestionRate = Math.min(bufferFullRate, 1.0);
-  }
-
-  // Reset buffer full events counter periodically
-  if (now - adaptiveInfo.lastAdjustmentTime > 5000) {
-    adaptiveInfo.recentBufferFullEvents = 0;
-    adaptiveInfo.lastAdjustmentTime = now;
-  }
+// 计算文件哈希值
+const calculateFileHash = async (file) => {
+  return new Promise((resolve, reject) => {
+    const chunkSize = 1024 * 1024; // 1MB 块大小
+    const chunks = Math.ceil(file.size / chunkSize);
+    let currentChunk = 0;
+    const sha256Instance = sha256.create();
+    
+    const loadNextChunk = () => {
+      const start = currentChunk * chunkSize;
+      const end = Math.min(start + chunkSize, file.size);
+      
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        sha256Instance.update(new Uint8Array(e.target.result));
+        currentChunk++;
+        
+        if (currentChunk < chunks) {
+          loadNextChunk();
+        } else {
+          resolve(sha256Instance.hex());
+        }
+      };
+      
+      reader.onerror = (e) => {
+        reject(new Error(`计算哈希值失败: ${e.target.error.message}`));
+      };
+      
+      reader.readAsArrayBuffer(file.slice(start, end));
+    };
+    
+    loadNextChunk();
+  });
 };
 
-
-
-// --- Enhanced File Transfer Logic ---
+// --- 文件选择和传输 ---
 const handleFileSelection = (event) => {
   selectedFile.value = event.target.files[0];
   errorMessage.value = '';
@@ -176,31 +163,21 @@ const handleFileSelection = (event) => {
   totalBytesSent.value = 0;
   currentSendSpeed.value = 0;
   isTransferring.value = false;
-
-  // Reset adaptive control
-  adaptiveInfo.enabled = false;
-  adaptiveInfo.currentChunkSize = BASE_CHUNK_SIZE;
-  adaptiveInfo.currentBufferLimit = INITIAL_BUFFER_LIMIT;
-  adaptiveInfo.congestionRate = 0;
-  adaptiveInfo.recentSendTimes = [];
-  adaptiveInfo.recentBufferFullEvents = 0;
-
-  // Reset transfer stats
-  transferStats.enabled = false;
-  transferStats.retransmissions = 0;
-  transferStats.totalPacketsSent = 0;
-  transferStats.packetLossRate = 0;
-  transferStats.rttMeasurements = [];
-  transferStats.averageRTT = 0;
-
-  // Clear existing transfers
-  for (const fileId in outgoingTransfers) {
+  
+  // 重置自适应参数
+  currentChunkSize.value = INITIAL_CHUNK_SIZE;
+  currentBufferLimit.value = INITIAL_BUFFER_LIMIT;
+  congestionRate.value = 0;
+  recentBufferFullEvents.value = 0;
+  
+  // 清理现有传输
+  Object.keys(outgoingTransfers).forEach(fileId => {
     const transfer = outgoingTransfers[fileId];
     if (!transfer.isComplete && transfer.reject) {
-      transfer.reject(new Error('New file selected, transfer cancelled.'));
+      transfer.reject(new Error('选择了新文件，传输已取消'));
     }
     delete outgoingTransfers[fileId];
-  }
+  });
 };
 
 const startFileTransfer = async () => {
@@ -227,31 +204,39 @@ const startFileTransfer = async () => {
   currentSendSpeed.value = 0;
   sendProgress.value = 0;
 
-  // Enable adaptive control and stats
-  adaptiveInfo.enabled = true;
-  transferStats.enabled = true;
-
-  startUiUpdateTimer();
-  startAdaptiveControlTimer();
-
   const file = selectedFile.value;
   const fileId = generateUniqueId();
-  const totalChunks = Math.ceil(file.size / adaptiveInfo.currentChunkSize);
+  
+  // 计算文件哈希值
+  let fileHash;
+  try {
+    fileHash = await calculateFileHash(file);
+  } catch (error) {
+    console.error('计算文件哈希值失败:', error);
+    errorMessage.value = '文件准备失败，请重试';
+    isTransferring.value = false;
+    return;
+  }
 
-  // Initialize transfer state
+  // 初始化传输状态
   const currentTransfer = {
     file,
     fileId,
-    totalChunks,
-    sentChunks: new Set(),
-    ackedChunks: new Set(),
-    pendingAcks: new Map(),
-    peers: {},
+    fileHash,
+    totalChunks: Math.ceil(file.size / currentChunkSize.value),
+    sentChunks: new Map(), // 存储每个块的发送状态
+    ackedChunks: new Set(), // 已确认接收的块
+    pendingAcks: new Map(), // 等待确认的块
+    peers: {}, // 每个对等端的传输状态
     transferStartTime: Date.now(),
     isComplete: false,
     resolve: null,
     reject: null,
-    chunkSize: adaptiveInfo.currentChunkSize
+    bytesSent: 0,
+    chunksProcessed: 0,
+    lastBufferCheckTime: Date.now(),
+    bufferFullEvents: 0,
+    speedHistory: [], // 存储最近的速度数据
   };
 
   outgoingTransfers[fileId] = currentTransfer;
@@ -261,66 +246,62 @@ const startFileTransfer = async () => {
     currentTransfer.reject = reject;
   });
 
-  // Setup transfer for each peer
+  // 为每个对等端设置传输
   activePeers.forEach(peerId => {
     const peerTransfer = {
       readQueue: [],
       isPeerComplete: false,
       lastAckTime: Date.now(),
       sendInProgress: false,
-      consecutiveFailures: 0
+      consecutiveFailures: 0,
+      bufferStatus: {
+        checks: 0,
+        full: 0
+      }
     };
     currentTransfer.peers[peerId] = peerTransfer;
 
-    // Send metadata
+    // 发送元数据
     const dc = peerConnections[peerId]?.dataChannel;
     if (dc?.readyState === 'open') {
-      sendMetaData(dc, fileId, file.name, file.size, file.type || 'application/octet-stream');
+      sendMetaData(dc, fileId, file.name, file.size, file.type || 'application/octet-stream', fileHash);
       processOutgoingQueue(fileId, peerId);
     }
   });
 
   try {
     await transferPromise;
-    console.log('File transfer completed successfully!');
+    console.log('文件传输成功完成!');
     errorMessage.value = '';
     sendProgress.value = 100;
   } catch (error) {
-    console.error('File transfer failed:', error);
+    console.error('文件传输失败:', error);
     errorMessage.value = `文件传输失败: ${error.message}`;
   } finally {
     isTransferring.value = false;
-    adaptiveInfo.enabled = false;
-    transferStats.enabled = false;
-    stopUiUpdateTimer();
-    stopAdaptiveControlTimer();
   }
 };
 
-// --- Enhanced Data Channel Management ---
+// --- 数据通道管理 ---
 const createDataPacket = (fileId, chunkIndex, chunkData) => {
+  // 数据包格式: [文件ID长度][文件ID][块索引][数据]
   const fileIdBytes = new TextEncoder().encode(fileId);
-  const header = new Uint8Array(1 + fileIdBytes.length + 4 + 8); // Added timestamp
-
+  const header = new Uint8Array(1 + fileIdBytes.length + 4);
+  
   let offset = 0;
   header[offset++] = fileIdBytes.length;
   header.set(fileIdBytes, offset);
   offset += fileIdBytes.length;
-
+  
+  // 写入块索引
   new DataView(header.buffer).setUint32(offset, chunkIndex, true);
-  offset += 4;
-
-  // Add timestamp for RTT measurement
-  new DataView(header.buffer).setBigUint64(offset, BigInt(Date.now()), true);
-
-  if (chunkData) {
-    const packet = new Uint8Array(header.length + chunkData.byteLength);
-    packet.set(header, 0);
-    packet.set(new Uint8Array(chunkData), header.length);
-    return packet.buffer;
-  }
-
-  return header.buffer;
+  
+  // 创建完整数据包
+  const packet = new Uint8Array(header.length + chunkData.byteLength);
+  packet.set(header, 0);
+  packet.set(new Uint8Array(chunkData), header.length);
+  
+  return packet.buffer;
 };
 
 const processOutgoingQueue = async (fileId, peerId) => {
@@ -335,17 +316,23 @@ const processOutgoingQueue = async (fileId, peerId) => {
 
   if (!dc || dc.readyState !== 'open') return;
 
-  // Enhanced buffer management with adaptive limits
-  const currentBufferLimit = adaptiveInfo.enabled ? adaptiveInfo.currentBufferLimit : INITIAL_BUFFER_LIMIT;
-  if (dc.bufferedAmount > currentBufferLimit) {
-    updateCongestionMetrics(Date.now(), true);
+  // 检查缓冲区状态
+  const now = Date.now();
+  if (now - transfer.lastBufferCheckTime > 1000) {
+    transfer.lastBufferCheckTime = now;
+    transfer.bufferFullEvents = 0;
+  }
+  
+  if (dc.bufferedAmount > currentBufferLimit.value) {
+    transfer.bufferFullEvents++;
+    recentBufferFullEvents.value++;
     return;
   }
 
   peerTransfer.sendInProgress = true;
 
   try {
-    // Find next chunk to send
+    // 查找下一个要发送的块
     let nextChunkIndex = -1;
     for (let i = 0; i < transfer.totalChunks; i++) {
       if (!transfer.ackedChunks.has(i) && !transfer.pendingAcks.has(i)) {
@@ -355,11 +342,10 @@ const processOutgoingQueue = async (fileId, peerId) => {
     }
 
     if (nextChunkIndex !== -1) {
-      const currentChunkSize = adaptiveInfo.enabled ? adaptiveInfo.currentChunkSize : BASE_CHUNK_SIZE;
-      const start = nextChunkIndex * currentChunkSize;
-      const end = Math.min(start + currentChunkSize, transfer.file.size);
+      const start = nextChunkIndex * currentChunkSize.value;
+      const end = Math.min(start + currentChunkSize.value, transfer.file.size);
 
-      // Use File.slice() and FileReader for better memory management
+      // 使用File.slice()和FileReader进行内存管理
       const slice = transfer.file.slice(start, end);
 
       const reader = new FileReader();
@@ -368,32 +354,40 @@ const processOutgoingQueue = async (fileId, peerId) => {
           const chunkData = e.target.result;
           const packet = createDataPacket(fileId, nextChunkIndex, chunkData);
 
+          // 发送数据包
           const sendStartTime = Date.now();
           dc.send(packet);
 
-          transfer.sentChunks.add(nextChunkIndex);
+          // 更新发送状态
+          transfer.sentChunks.set(nextChunkIndex, {
+            timestamp: sendStartTime,
+            retries: 0,
+            data: packet,
+            peerId
+          });
+          
           transfer.pendingAcks.set(nextChunkIndex, {
             timestamp: sendStartTime,
             retries: 0,
             data: packet
           });
 
-          transferStats.totalPacketsSent++;
+          // 更新统计信息
+          transfer.bytesSent += slice.size;
           totalBytesSent.value += slice.size;
+          transfer.chunksProcessed++;
 
-          updateCongestionMetrics(Date.now() - sendStartTime, false);
-
-          // Continue processing queue
+          // 继续处理队列
           setTimeout(() => {
             peerTransfer.sendInProgress = false;
             processOutgoingQueue(fileId, peerId);
-          }, 1); // Small delay to prevent blocking
+          }, 1);
 
         } catch (sendError) {
-          console.error(`Error sending chunk ${nextChunkIndex} to ${peerId}:`, sendError);
+          console.error(`向 ${peerId} 发送块 ${nextChunkIndex} 时出错:`, sendError);
           peerTransfer.consecutiveFailures++;
           if (peerTransfer.consecutiveFailures > 5) {
-            console.warn(`Too many failures for peer ${peerId}, closing connection`);
+            console.warn(`对等端 ${peerId} 失败次数过多，关闭连接`);
             closePeerConnection(peerId);
           }
           peerTransfer.sendInProgress = false;
@@ -401,14 +395,14 @@ const processOutgoingQueue = async (fileId, peerId) => {
       };
 
       reader.onerror = (e) => {
-        console.error(`FileReader error for chunk ${nextChunkIndex}:`, e.target.error);
+        console.error(`文件读取器错误，块 ${nextChunkIndex}:`, e.target.error);
         peerTransfer.sendInProgress = false;
       };
 
       reader.readAsArrayBuffer(slice);
     } else {
       peerTransfer.sendInProgress = false;
-      // Check if transfer is complete
+      // 检查传输是否完成
       if (transfer.ackedChunks.size === transfer.totalChunks && !peerTransfer.isPeerComplete) {
         sendCompletionMessage(dc, fileId);
         peerTransfer.isPeerComplete = true;
@@ -416,16 +410,16 @@ const processOutgoingQueue = async (fileId, peerId) => {
       }
     }
   } catch (error) {
-    console.error(`Error in processOutgoingQueue for ${peerId}:`, error);
+    console.error(`处理输出队列时出错，对等端 ${peerId}:`, error);
     peerTransfer.sendInProgress = false;
     peerTransfer.consecutiveFailures++;
   }
 };
 
-// --- WebSocket and WebRTC Management (keeping existing logic but enhanced error handling) ---
+// --- 消息处理 ---
 const sendWsMessage = (type, data = {}, to = null) => {
   if (ws.value?.readyState !== WebSocket.OPEN) {
-    console.warn('WebSocket not open, cannot send message:', type);
+    console.warn('WebSocket未打开，无法发送消息:', type);
     return;
   }
   try {
@@ -433,24 +427,26 @@ const sendWsMessage = (type, data = {}, to = null) => {
     if (to) message.to = to;
     ws.value.send(JSON.stringify(message));
   } catch (error) {
-    console.error('Error sending WebSocket message:', error);
+    console.error('发送WebSocket消息时出错:', error);
   }
 };
 
-const sendMetaData = (dc, fileId, name, size, type) => {
+const sendMetaData = (dc, fileId, name, size, type, hash) => {
   const metadata = {
     type: 'file-metadata',
     fileId: fileId,
     name: name,
     size: size,
     fileType: type,
-    chunkSize: adaptiveInfo.currentChunkSize
+    chunkSize: currentChunkSize.value,
+    hash: hash,
+    totalChunks: Math.ceil(size / currentChunkSize.value)
   };
   try {
     dc.send(JSON.stringify(metadata));
-    console.log(`Sent metadata for file ${fileId} (${name}) to peer via DataChannel.`);
+    console.log(`向对等端通过数据通道发送文件 ${fileId} (${name}) 的元数据`);
   } catch (e) {
-    console.error('Error sending metadata:', e);
+    console.error('发送元数据时出错:', e);
   }
 };
 
@@ -462,7 +458,7 @@ const sendCompletionMessage = (dc, fileId) => {
   try {
     dc.send(JSON.stringify(completionMsg));
   } catch (e) {
-    console.error('Error sending completion message:', e);
+    console.error('发送完成消息时出错:', e);
   }
 };
 
@@ -473,75 +469,39 @@ const checkOverallTransferCompletion = (fileId) => {
   const allPeersComplete = Object.values(transfer.peers).every(p => p.isPeerComplete);
   if (allPeersComplete) {
     transfer.isComplete = true;
+    console.log(`文件传输完成: ${transfer.file.name} (${formatBytes(transfer.file.size)})`);
+    console.log(`传输时间: ${(Date.now() - transfer.transferStartTime) / 1000} 秒`);
+    console.log(`平均速度: ${formatSpeed(transfer.bytesSent / ((Date.now() - transfer.transferStartTime) / 1000))}`);
+    
     if (transfer.resolve) transfer.resolve();
   }
 };
 
 const handleChunkAck = (fileId, chunkIndex, peerId) => {
   const transfer = outgoingTransfers[fileId];
-  if (transfer && !transfer.ackedChunks.has(chunkIndex)) {
-    const pendingAck = transfer.pendingAcks.get(chunkIndex);
-    if (pendingAck) {
-      // Calculate RTT
-      const rtt = Date.now() - pendingAck.timestamp;
-      transferStats.rttMeasurements.push(rtt);
-      if (transferStats.rttMeasurements.length > 100) {
-        transferStats.rttMeasurements.shift(); // Keep last 100 measurements
-      }
-      transferStats.averageRTT = Math.round(
-        transferStats.rttMeasurements.reduce((a, b) => a + b, 0) / transferStats.rttMeasurements.length
-      );
+  if (!transfer) return;
+  
+  const pendingAck = transfer.pendingAcks.get(chunkIndex);
+  if (pendingAck) {
+    // 计算RTT
+    const rtt = Date.now() - pendingAck.timestamp;
+    
+    // 更新传输统计
+    const peerTransfer = transfer.peers[peerId];
+    if (peerTransfer) {
+      peerTransfer.lastAckTime = Date.now();
+      peerTransfer.consecutiveFailures = 0;
     }
-
+    
     transfer.ackedChunks.add(chunkIndex);
     transfer.pendingAcks.delete(chunkIndex);
-
-    // Reset consecutive failures for this peer
-    if (transfer.peers[peerId]) {
-      transfer.peers[peerId].consecutiveFailures = 0;
-    }
-
+    
+    // 继续处理队列
     processOutgoingQueue(fileId, peerId);
   }
 };
 
-// --- Timer Management ---
-let uiUpdateTimer = null;
-let adaptiveControlTimer = null;
-let retransmissionTimer = null;
-
-const startUiUpdateTimer = () => {
-  if (uiUpdateTimer) clearInterval(uiUpdateTimer);
-  uiUpdateTimer = setInterval(updateSendProgress, UI_UPDATE_INTERVAL);
-};
-
-const stopUiUpdateTimer = () => {
-  if (uiUpdateTimer) {
-    clearInterval(uiUpdateTimer);
-    uiUpdateTimer = null;
-  }
-};
-
-const startAdaptiveControlTimer = () => {
-  if (adaptiveControlTimer) clearInterval(adaptiveControlTimer);
-  adaptiveControlTimer = setInterval(adjustTransferParameters, ADAPTIVE_ADJUSTMENT_INTERVAL);
-};
-
-const stopAdaptiveControlTimer = () => {
-  if (adaptiveControlTimer) {
-    clearInterval(adaptiveControlTimer);
-    adaptiveControlTimer = null;
-  }
-};
-
-
-const stopRetransmissionTimer = () => {
-  if (retransmissionTimer) {
-    clearInterval(retransmissionTimer);
-    retransmissionTimer = null;
-  }
-};
-
+// --- UI更新 ---
 const updateSendProgress = () => {
   const now = Date.now();
   const timeDiffSeconds = (now - lastSpeedCalcTime.value) / 1000;
@@ -549,6 +509,21 @@ const updateSendProgress = () => {
   if (timeDiffSeconds >= (UI_UPDATE_INTERVAL / 1000)) {
     const bytesDiff = totalBytesSent.value - lastBytesSentForSpeed.value;
     currentSendSpeed.value = bytesDiff / timeDiffSeconds;
+    
+    // 保存速度历史记录
+    const currentTransfer = Object.values(outgoingTransfers).find(t => !t.isComplete);
+    if (currentTransfer) {
+      currentTransfer.speedHistory.push({
+        time: now,
+        speed: currentSendSpeed.value
+      });
+      
+      // 保留最近10秒的数据
+      currentTransfer.speedHistory = currentTransfer.speedHistory.filter(
+        entry => now - entry.time < 10000
+      );
+    }
+    
     lastBytesSentForSpeed.value = totalBytesSent.value;
     lastSpeedCalcTime.value = now;
   }
@@ -569,9 +544,98 @@ const updateSendProgress = () => {
   }
 };
 
-// --- WebSocket Connection Management (keeping existing logic but enhanced) ---
-let heartbeatIntervalId;
+// --- 自适应传输参数调整 ---
+const adjustTransferParameters = () => {
+  if (!isTransferring.value) return;
+  
+  // 计算拥塞率
+  const now = Date.now();
+  congestionRate.value = recentBufferFullEvents.value / Math.max(1, Object.values(outgoingTransfers).length);
+  recentBufferFullEvents.value = 0;
+  
+  // 根据拥塞率调整传输参数
+  if (congestionRate.value > CONGESTION_THRESHOLD) {
+    // 高拥塞 - 减少块大小和缓冲区限制
+    currentChunkSize.value = Math.max(
+      MIN_CHUNK_SIZE,
+      Math.floor(currentChunkSize.value * 0.8)
+    );
+    currentBufferLimit.value = Math.max(
+      MIN_BUFFER_LIMIT,
+      Math.floor(currentBufferLimit.value * 0.9)
+    );
+  } else if (congestionRate.value < 0.2) {
+    // 低拥塞 - 增加块大小和缓冲区限制
+    currentChunkSize.value = Math.min(
+      MAX_CHUNK_SIZE,
+      Math.floor(currentChunkSize.value * 1.2)
+    );
+    currentBufferLimit.value = Math.min(
+      MAX_BUFFER_LIMIT,
+      Math.floor(currentBufferLimit.value * 1.1)
+    );
+  }
+  
+  // 更新所有传输的块大小
+  Object.values(outgoingTransfers).forEach(transfer => {
+    if (!transfer.isComplete) {
+      transfer.totalChunks = Math.ceil(transfer.file.size / currentChunkSize.value);
+    }
+  });
+};
 
+// --- 重传机制 ---
+const checkAndRetransmit = () => {
+  const now = Date.now();
+  
+  for (const fileId in outgoingTransfers) {
+    const transfer = outgoingTransfers[fileId];
+    if (transfer.isComplete) continue;
+    
+    transfer.pendingAcks.forEach((pendingAck, chunkIndex) => {
+      // 检查ACK是否超时
+      if (now - pendingAck.timestamp > ACK_TIMEOUT) {
+        if (pendingAck.retries < MAX_RETRIES) {
+          // 查找可以重传的对等端
+          let retransmitted = false;
+          
+          for (const peerId in transfer.peers) {
+            const peer = peerConnections[peerId];
+            if (!peer || peer.status !== 'connected') continue;
+            
+            const dc = peer.dataChannel;
+            if (dc?.readyState === 'open' && !transfer.peers[peerId].isPeerComplete) {
+              try {
+                // 检查缓冲区状态
+                if (dc.bufferedAmount < currentBufferLimit.value * 0.8) {
+                  dc.send(pendingAck.data);
+                  pendingAck.timestamp = now;
+                  pendingAck.retries++;
+                  retransmitted = true;
+                  break;
+                }
+              } catch (e) {
+                console.error(`向 ${peerId} 重传块 ${chunkIndex} 时出错:`, e);
+              }
+            }
+          }
+          
+          // 如果没有找到可用的对等端，增加重试计数
+          if (!retransmitted) {
+            pendingAck.retries++;
+          }
+        } else {
+          // 达到最大重试次数，标记为已确认但记录错误
+          console.warn(`块 ${chunkIndex} 达到最大重试次数，标记为已确认`);
+          transfer.ackedChunks.add(chunkIndex);
+          transfer.pendingAcks.delete(chunkIndex);
+        }
+      }
+    });
+  }
+};
+
+// --- WebSocket和WebRTC管理 ---
 const startHeartbeat = () => {
   stopHeartbeat();
   heartbeatIntervalId = setInterval(() => {
@@ -596,7 +660,7 @@ const connectWebSocket = () => {
   ws.value = new WebSocket(WS_URL);
 
   ws.value.onopen = () => {
-    console.log('WebSocket connection established.');
+    console.log('WebSocket连接已建立');
     startHeartbeat();
     sendWsMessage('get-users');
   };
@@ -627,19 +691,19 @@ const connectWebSocket = () => {
           break;
       }
     } catch (error) {
-      console.error('Error handling WebSocket message:', error);
+      console.error('处理WebSocket消息时出错:', error);
     }
   };
 
   ws.value.onclose = () => {
-    console.log('WebSocket connection closed. Reconnecting...');
+    console.log('WebSocket连接已关闭。正在重新连接...');
     stopHeartbeat();
     Object.keys(peerConnections).forEach(closePeerConnection);
     setTimeout(connectWebSocket, 5000);
   };
 
   ws.value.onerror = (error) => {
-    console.error('WebSocket error:', error);
+    console.error('WebSocket错误:', error);
     ws.value?.close();
   };
 };
@@ -667,7 +731,6 @@ const handleUserList = (users) => {
   });
 };
 
-// 继续补充 handleSignalingOffer 函数
 const handleSignalingOffer = async (sdp, from) => {
   if (!peerConnections[from]) {
     createPeerConnection(from);
@@ -680,12 +743,11 @@ const handleSignalingOffer = async (sdp, from) => {
     await pc.setLocalDescription(answer);
     sendWsMessage('answer', { sdp: answer, to: from });
   } catch (error) {
-    console.error('Error handling signaling offer:', error);
+    console.error('处理信令offer时出错:', error);
     closePeerConnection(from);
   }
 };
 
-// 补充 handleSignalingAnswer 函数
 const handleSignalingAnswer = async (sdp, from) => {
   const pc = peerConnections[from]?.connection;
   if (!pc) return;
@@ -693,12 +755,11 @@ const handleSignalingAnswer = async (sdp, from) => {
   try {
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
   } catch (error) {
-    console.error('Error handling signaling answer:', error);
+    console.error('处理信令answer时出错:', error);
     closePeerConnection(from);
   }
 };
 
-// 补充 handleSignalingCandidate 函数
 const handleSignalingCandidate = async (candidate, from) => {
   const pc = peerConnections[from]?.connection;
   if (!pc) return;
@@ -706,11 +767,10 @@ const handleSignalingCandidate = async (candidate, from) => {
   try {
     await pc.addIceCandidate(new RTCIceCandidate(candidate));
   } catch (error) {
-    console.error('Error handling ICE candidate:', error);
+    console.error('处理ICE候选者时出错:', error);
   }
 };
 
-// 补充 createPeerConnection 函数
 const createPeerConnection = (peerId) => {
   if (peerConnections[peerId]) return;
 
@@ -718,7 +778,14 @@ const createPeerConnection = (peerId) => {
   peerConnections[peerId] = {
     connection: pc,
     status: 'connecting',
-    dataChannel: null
+    dataChannel: null,
+    lastActivity: Date.now(),
+    stats: {
+      bytesSent: 0,
+      bytesReceived: 0,
+      messagesSent: 0,
+      messagesReceived: 0
+    }
   };
 
   // ICE候选者处理
@@ -733,6 +800,9 @@ const createPeerConnection = (peerId) => {
     const state = pc.iceConnectionState;
     if (state === 'disconnected' || state === 'failed' || state === 'closed') {
       closePeerConnection(peerId);
+    } else if (state === 'connected') {
+      peerConnections[peerId].status = 'connected';
+      console.log(`与 ${peerId} 的连接已建立`);
     }
   };
 
@@ -752,7 +822,6 @@ const createPeerConnection = (peerId) => {
   };
 };
 
-// 补充 createOffer 函数
 const createOffer = async (peerId) => {
   const pc = peerConnections[peerId]?.connection;
   if (!pc) return;
@@ -762,12 +831,11 @@ const createOffer = async (peerId) => {
     await pc.setLocalDescription(offer);
     sendWsMessage('offer', { sdp: offer, to: peerId });
   } catch (error) {
-    console.error('Error creating offer:', error);
+    console.error('创建offer时出错:', error);
     closePeerConnection(peerId);
   }
 };
 
-// 补充 closePeerConnection 函数
 const closePeerConnection = (peerId) => {
   const peer = peerConnections[peerId];
   if (!peer) return;
@@ -778,6 +846,7 @@ const closePeerConnection = (peerId) => {
   }
 
   // 清理状态
+  peer.status = 'disconnected';
   delete peerConnections[peerId];
 
   // 清理进行中的传输
@@ -789,17 +858,65 @@ const closePeerConnection = (peerId) => {
       // 检查是否所有对等端都断开
       if (Object.keys(transfer.peers).length === 0 && !transfer.isComplete) {
         if (transfer.reject) {
-          transfer.reject(new Error('All peers disconnected during transfer'));
+          transfer.reject(new Error('传输过程中所有对等端断开连接'));
         }
         delete outgoingTransfers[fileId];
       }
     }
   }
 
-  console.log(`Closed connection to peer ${peerId}`);
+  console.log(`已关闭与对等端 ${peerId} 的连接`);
 };
 
-// 补充 handleDataChannelMessage 函数
+// --- 数据通道消息处理 ---
+const setupDataChannel = (dc, peerId) => {
+  const peer = peerConnections[peerId];
+  peer.dataChannel = dc;
+  
+  dc.onopen = () => {
+    peer.status = 'connected';
+    peer.lastActivity = Date.now();
+    console.log(`与 ${peerId} 的数据通道已打开`);
+  };
+  
+  dc.onclose = () => {
+    peer.status = 'disconnected';
+    console.log(`与 ${peerId} 的数据通道已关闭`);
+    
+    // 尝试重连
+    if (isTransferring.value) {
+      console.log(`尝试重新连接到 ${peerId}...`);
+      setTimeout(() => {
+        if (peerConnections[peerId]?.status !== 'connected') {
+          createPeerConnection(peerId);
+          createOffer(peerId);
+        }
+      }, 3000);
+    }
+  };
+  
+  dc.onerror = (error) => {
+    console.error(`与 ${peerId} 的数据通道错误:`, error);
+    closePeerConnection(peerId);
+  };
+  
+  dc.onmessage = (event) => {
+    peer.lastActivity = Date.now();
+    peer.stats.messagesReceived++;
+    
+    try {
+      if (typeof event.data === 'string') {
+        const msg = JSON.parse(event.data);
+        handleDataChannelMessage(msg, peerId);
+      } else {
+        handleFileChunk(event.data, peerId);
+      }
+    } catch (error) {
+      console.error('处理数据通道消息时出错:', error);
+    }
+  };
+};
+
 const handleDataChannelMessage = (msg, peerId) => {
   switch (msg.type) {
     case 'file-metadata':
@@ -811,12 +928,14 @@ const handleDataChannelMessage = (msg, peerId) => {
     case 'file-transfer-complete':
       handleTransferComplete(msg.fileId, peerId);
       break;
+    case 'ping':
+      // 忽略ping消息
+      break;
     default:
-      console.warn('Unknown data channel message type:', msg.type);
+      console.warn('未知数据通道消息类型:', msg.type);
   }
 };
 
-// 补充 handleFileMetadata 函数
 const handleFileMetadata = (metadata, peerId) => {
   const fileId = metadata.fileId;
 
@@ -827,13 +946,16 @@ const handleFileMetadata = (metadata, peerId) => {
     name: metadata.name,
     size: metadata.size,
     type: metadata.fileType,
+    hash: metadata.hash,
     receivedChunks: new Map(),
-    chunksCount: Math.ceil(metadata.size / metadata.chunkSize),
+    chunksCount: metadata.totalChunks,
     chunksReceived: 0,
     progress: 0,
     fileId: fileId,
     peerId: peerId,
-    startTime: Date.now()
+    startTime: Date.now(),
+    completed: false,
+    fileData: null
   };
 
   // 添加到接收文件列表
@@ -843,82 +965,19 @@ const handleFileMetadata = (metadata, peerId) => {
     size: metadata.size,
     progress: 0,
     url: '',
-    peerId: peerId
+    peerId: peerId,
+    error: null
   });
 
-  console.log(`Receiving file ${metadata.name} (${formatBytes(metadata.size)}) from ${peerId}`);
+  console.log(`正在从 ${peerId} 接收文件 ${metadata.name} (${formatBytes(metadata.size)})`);
 };
-
-
-// 补充 handleTransferComplete 函数
-const handleTransferComplete = (fileId, peerId) => {
-  const transfer = outgoingTransfers[fileId];
-  if (transfer && transfer.peers[peerId]) {
-    transfer.peers[peerId].isPeerComplete = true;
-    checkOverallTransferCompletion(fileId);
-  }
-};
-
-// 补充生命周期钩子
-onMounted(() => {
-  connectWebSocket();
-  startRetransmissionTimer();
-});
-
-onUnmounted(() => {
-  // 清理资源
-  ws.value?.close();
-  stopHeartbeat();
-  stopUiUpdateTimer();
-  stopAdaptiveControlTimer();
-  stopRetransmissionTimer();
-
-  // 关闭所有对等连接
-  Object.keys(peerConnections).forEach(closePeerConnection);
-
-  // 清理接收文件的URL
-  receivedFiles.forEach(file => {
-    if (file.url) URL.revokeObjectURL(file.url);
-  });
-});
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 const handleFileChunk = (data, peerId) => {
   try {
+    // 解析头部
     const view = new DataView(data);
     let offset = 0;
     
-    // 解析头部
     const fileIdLength = view.getUint8(offset++);
     const fileId = new TextDecoder().decode(
       data.slice(offset, offset + fileIdLength)
@@ -928,17 +987,13 @@ const handleFileChunk = (data, peerId) => {
     const chunkIndex = view.getUint32(offset, true);
     offset += 4;
     
-    // 提取时间戳用于ACK
-    const timestamp = Number(view.getBigUint64(offset, true));
-    offset += 8;
-    
-    // 修复：直接使用原始数据切片，避免DataView截断问题
+    // 提取数据
     const chunkData = data.slice(offset);
     
     // 处理文件块
     const fileInfo = incomingFiles[fileId];
     if (!fileInfo) {
-      console.warn(`Received chunk for unknown file: ${fileId}`);
+      console.warn(`收到未知文件的块: ${fileId}`);
       return;
     }
     
@@ -947,7 +1002,7 @@ const handleFileChunk = (data, peerId) => {
       return;
     }
     
-    // 存储块 - 直接存储ArrayBuffer
+    // 存储块
     fileInfo.receivedChunks.set(chunkIndex, chunkData);
     fileInfo.chunksReceived++;
     
@@ -967,27 +1022,34 @@ const handleFileChunk = (data, peerId) => {
       dc.send(JSON.stringify({
         type: 'chunk-ack',
         fileId: fileId,
-        chunkIndex: chunkIndex,
-        timestamp: timestamp
+        chunkIndex: chunkIndex
       }));
     }
     
     // 检查是否完成
-    if (fileInfo.chunksReceived === fileInfo.chunksCount) {
+    if (fileInfo.chunksReceived === fileInfo.chunksCount && !fileInfo.completed) {
       finalizeFile(fileId);
     }
   } catch (error) {
-    console.error('Error processing file chunk:', error);
+    console.error('处理文件块时出错:', error);
   }
 };
 
-// 修复文件组装问题
-const finalizeFile = (fileId) => {
+const handleTransferComplete = (fileId, peerId) => {
+  const transfer = outgoingTransfers[fileId];
+  if (transfer && transfer.peers[peerId]) {
+    transfer.peers[peerId].isPeerComplete = true;
+    checkOverallTransferCompletion(fileId);
+  }
+};
+
+// --- 文件组装 ---
+const finalizeFile = async (fileId) => {
   const fileInfo = incomingFiles[fileId];
   if (!fileInfo) return;
   
   try {
-    // 按顺序组合块 - 修复：直接使用ArrayBuffer
+    // 按顺序组合块
     const chunks = [];
     let totalSize = 0;
     
@@ -995,7 +1057,7 @@ const finalizeFile = (fileId) => {
     for (let i = 0; i < fileInfo.chunksCount; i++) {
       const chunk = fileInfo.receivedChunks.get(i);
       if (!chunk) {
-        throw new Error(`Missing chunk ${i} for file ${fileInfo.name}`);
+        throw new Error(`文件 ${fileInfo.name} 缺少块 ${i}`);
       }
       totalSize += chunk.byteLength;
     }
@@ -1013,6 +1075,14 @@ const finalizeFile = (fileId) => {
     // 创建Blob
     const blob = new Blob([buffer], { type: fileInfo.type });
     
+    // 验证文件完整性
+    if (fileInfo.hash) {
+      const receivedHash = await calculateFileHash(blob);
+      if (receivedHash !== fileInfo.hash) {
+        throw new Error(`文件校验失败: 预期 ${fileInfo.hash}, 实际 ${receivedHash}`);
+      }
+    }
+    
     // 创建下载URL
     const url = URL.createObjectURL(blob);
     
@@ -1024,13 +1094,17 @@ const finalizeFile = (fileId) => {
       receivedFile.size = blob.size;
     }
     
+    // 标记为已完成
+    fileInfo.completed = true;
+    fileInfo.fileData = blob;
+    
     // 清理临时数据
     delete incomingFiles[fileId];
     
-    console.log(`File ${fileInfo.name} received successfully in ${(Date.now() - fileInfo.startTime)/1000} seconds`);
-    console.log(`Original size: ${fileInfo.size}, Received size: ${blob.size}`);
+    console.log(`文件 ${fileInfo.name} 接收成功，用时 ${(Date.now() - fileInfo.startTime)/1000} 秒`);
+    console.log(`原始大小: ${fileInfo.size}, 接收大小: ${blob.size}`);
   } catch (error) {
-    console.error(`Error finalizing file ${fileInfo.name}:`, error);
+    console.error(`完成文件 ${fileInfo.name} 时出错:`, error);
     
     // 更新UI显示错误
     const receivedFile = receivedFiles.find(f => f.id === fileId);
@@ -1041,412 +1115,124 @@ const finalizeFile = (fileId) => {
   }
 };
 
-// --- 修复传输卡顿问题 ---
-
-// 增强连接状态监控
-const setupDataChannel = (dc, peerId) => {
-  const peer = peerConnections[peerId];
-  peer.dataChannel = dc;
-  
-  dc.onopen = () => {
-    peer.status = 'connected';
-    peer.lastActivity = Date.now();
-    console.log(`Data channel with ${peerId} opened`);
-  };
-  
-  dc.onclose = () => {
-    peer.status = 'disconnected';
-    console.log(`Data channel with ${peerId} closed`);
-    
-    // 重连机制
-    if (isTransferring.value) {
-      console.log(`Attempting to reconnect to ${peerId}...`);
-      setTimeout(() => {
-        if (peerConnections[peerId]?.status !== 'connected') {
-          createPeerConnection(peerId);
-          createOffer(peerId);
-        }
-      }, 3000);
-    }
-  };
-  
-  dc.onerror = (error) => {
-    console.error(`Data channel error with ${peerId}:`, error);
-    closePeerConnection(peerId);
-  };
-  
-  dc.onmessage = (event) => {
-    peer.lastActivity = Date.now(); // 更新最后活动时间
-    
-    try {
-      if (typeof event.data === 'string') {
-        const msg = JSON.parse(event.data);
-        handleDataChannelMessage(msg, peerId);
-      } else {
-        handleFileChunk(event.data, peerId);
-      }
-    } catch (error) {
-      console.error('Error processing data channel message:', error);
-    }
-  };
-};
-
-// 添加心跳检测
-const startConnectionMonitoring = () => {
+// --- 连接监控 ---
+const monitorConnections = () => {
   setInterval(() => {
     const now = Date.now();
+    
     Object.keys(peerConnections).forEach(peerId => {
       const peer = peerConnections[peerId];
       
       // 检查数据通道活动
       if (peer.status === 'connected' && 
           peer.lastActivity && 
-          (now - peer.lastActivity) > 30000) {
-        console.warn(`No activity from ${peerId} for 30s, sending ping`);
-        
-        // 发送心跳包
-        try {
-          if (peer.dataChannel?.readyState === 'open') {
-            peer.dataChannel.send(JSON.stringify({ type: 'ping' }));
-          }
-        } catch (error) {
-          console.error(`Error sending ping to ${peerId}:`, error);
-        }
-      }
-      
-      // 检查超时
-      if (peer.status === 'connected' && 
-          peer.lastActivity && 
-          (now - peer.lastActivity) > 60000) {
-        console.warn(`Connection to ${peerId} timed out, closing`);
+          (now - peer.lastActivity) > CONNECTION_TIMEOUT) {
+        console.warn(`与 ${peerId} 超过 ${CONNECTION_TIMEOUT/1000} 秒无活动，关闭连接`);
         closePeerConnection(peerId);
       }
     });
   }, 10000);
 };
 
-// 修改自适应算法，避免过度降速
-const adjustTransferParameters = () => {
-  if (!adaptiveInfo.enabled) return;
+// --- 定时器管理 ---
+let heartbeatIntervalId = null;
+let uiUpdateIntervalId = null;
+let adaptiveIntervalId = null;
+let retransmissionIntervalId = null;
 
-  const now = Date.now();
-  if (now - adaptiveInfo.lastAdjustmentTime < ADAPTIVE_ADJUSTMENT_INTERVAL) return;
-
-  const congestionRate = adaptiveInfo.congestionRate;
+const startTimers = () => {
+  // UI更新定时器
+  uiUpdateIntervalId = setInterval(updateSendProgress, UI_UPDATE_INTERVAL);
   
-  // 更保守的调整策略
-  if (congestionRate > 0.4) {
-    // 高拥塞 - 适度减少块大小
-    adaptiveInfo.currentChunkSize = Math.max(
-      MIN_CHUNK_SIZE,
-      Math.floor(adaptiveInfo.currentChunkSize * 0.9) // 仅减少10%
-    );
-    adaptiveInfo.currentBufferLimit = Math.max(
-      MIN_BUFFER_LIMIT,
-      Math.floor(adaptiveInfo.currentBufferLimit * 0.95) // 仅减少5%
-    );
-  } else if (congestionRate < 0.1 && activePeersCount.value > 0) {
-    // 低拥塞 - 谨慎增加
-    adaptiveInfo.currentChunkSize = Math.min(
-      MAX_CHUNK_SIZE,
-      Math.floor(adaptiveInfo.currentChunkSize * 1.05) // 仅增加5%
-    );
-    adaptiveInfo.currentBufferLimit = Math.min(
-      MAX_BUFFER_LIMIT,
-      Math.floor(adaptiveInfo.currentBufferLimit * 1.03) // 仅增加3%
-    );
+  // 自适应参数调整定时器
+  adaptiveIntervalId = setInterval(adjustTransferParameters, ADAPTIVE_INTERVAL);
+  
+  // 重传定时器
+  retransmissionIntervalId = setInterval(checkAndRetransmit, ACK_TIMEOUT / 2);
+};
+
+const stopTimers = () => {
+  if (uiUpdateIntervalId) {
+    clearInterval(uiUpdateIntervalId);
+    uiUpdateIntervalId = null;
   }
-
-  console.log(`Adaptive adjustment: 
-    ChunkSize: ${formatBytes(adaptiveInfo.currentChunkSize)}, 
-    BufferLimit: ${formatBytes(adaptiveInfo.currentBufferLimit)},
-    Congestion: ${(congestionRate * 100).toFixed(1)}%`);
-
-  adaptiveInfo.lastAdjustmentTime = now;
+  
+  if (adaptiveIntervalId) {
+    clearInterval(adaptiveIntervalId);
+    adaptiveIntervalId = null;
+  }
+  
+  if (retransmissionIntervalId) {
+    clearInterval(retransmissionIntervalId);
+    retransmissionIntervalId = null;
+  }
 };
 
-// 增强重传机制
-const startRetransmissionTimer = () => {
-  if (retransmissionTimer) return;
-  retransmissionTimer = setInterval(() => {
-    const now = Date.now();
-    for (const fileId in outgoingTransfers) {
-      const transfer = outgoingTransfers[fileId];
-      if (transfer.isComplete) continue;
+// --- 计算属性 ---
+const wsStatus = computed(() => {
+  if (!ws.value) return { class: 'disconnected', text: '未连接' };
+  switch (ws.value.readyState) {
+    case WebSocket.OPEN: return { class: 'connected', text: '已连接' };
+    case WebSocket.CONNECTING: return { class: 'connecting', text: '连接中' };
+    case WebSocket.CLOSING: return { class: 'disconnected', text: '关闭中' };
+    case WebSocket.CLOSED: return { class: 'disconnected', text: '已断开' };
+    default: return { class: 'disconnected', text: '未知' };
+  }
+});
 
-      transfer.pendingAcks.forEach((item, chunkIndex) => {
-        // 跳过最近发送的块
-        if (now - item.timestamp < RETRANSMIT_TIMEOUT) return;
-        
-        if (item.retries < MAX_RETRANSMITS) {
-          let sent = false;
-          
-          // 尝试所有活跃对等端
-          for (const peerId in transfer.peers) {
-            const peer = peerConnections[peerId];
-            if (!peer || peer.status !== 'connected') continue;
-            
-            const dc = peer.dataChannel;
-            if (dc?.readyState === 'open' && !transfer.peers[peerId].isPeerComplete) {
-              const currentBufferLimit = adaptiveInfo.enabled ? 
-                adaptiveInfo.currentBufferLimit : 
-                INITIAL_BUFFER_LIMIT;
-              
-              // 检查缓冲区状态
-              if (dc.bufferedAmount < currentBufferLimit * 0.8) {
-                try {
-                  dc.send(item.data);
-                  item.timestamp = now;
-                  item.retries++;
-                  transferStats.retransmissions++;
-                  sent = true;
-                  
-                  // 更新丢包率
-                  transferStats.packetLossRate = 
-                    transferStats.retransmissions / 
-                    Math.max(transferStats.totalPacketsSent, 1);
-                  
-                  break; // 发送成功后跳出循环
-                } catch (e) {
-                  console.error(`Error retransmitting chunk ${chunkIndex} to ${peerId}:`, e);
-                }
-              }
-            }
-          }
-          
-          // 如果所有对等端都失败，增加重试计数
-          if (!sent) {
-            item.retries++;
-          }
-        } else {
-          console.error(`Max retransmits reached for chunk ${chunkIndex} of ${fileId}`);
-          transfer.pendingAcks.delete(chunkIndex);
-          
-          // 标记为失败但继续传输
-          transfer.ackedChunks.add(chunkIndex);
-        }
-      });
-    }
-  }, 1000);
-};
+const activePeersCount = computed(() => {
+  return Object.values(peerConnections).filter(pc =>
+    pc.status === 'connected' && pc.dataChannel?.readyState === 'open'
+  ).length;
+});
 
-// 添加块超时处理
-const checkChunkTimeouts = () => {
-  setInterval(() => {
-    const now = Date.now();
-    for (const fileId in outgoingTransfers) {
-      const transfer = outgoingTransfers[fileId];
-      if (transfer.isComplete) continue;
-      
-      transfer.pendingAcks.forEach((item, chunkIndex) => {
-        if (now - item.timestamp > RETRANSMIT_TIMEOUT * 3) {
-          console.warn(`Chunk ${chunkIndex} timeout, skipping`);
-          transfer.pendingAcks.delete(chunkIndex);
-          transfer.ackedChunks.add(chunkIndex);
-        }
-      });
-    }
-  }, 5000);
-};
-
-// --- 在生命周期钩子中启动监控 ---
+// --- 生命周期钩子 ---
 onMounted(() => {
   connectWebSocket();
-  startRetransmissionTimer();
-  startConnectionMonitoring();
-  checkChunkTimeouts();
+  startTimers();
+  monitorConnections();
+});
+
+onUnmounted(() => {
+  // 清理资源
+  ws.value?.close();
+  stopHeartbeat();
+  stopTimers();
+
+  // 关闭所有对等连接
+  Object.keys(peerConnections).forEach(closePeerConnection);
+
+  // 清理接收文件的URL
+  receivedFiles.forEach(file => {
+    if (file.url) URL.revokeObjectURL(file.url);
+  });
+});
+
+// 监听传输状态变化
+watchEffect(() => {
+  if (isTransferring.value) {
+    startTimers();
+  } else {
+    stopTimers();
+  }
 });
 </script>
 
 <style scoped>
 .webrtc-file-transfer-container {
-
   max-width: 800px;
-
   margin: 0 auto;
-
   padding: 20px;
-
   font-family: Arial, sans-serif;
-
 }
 
-.connection-info,
-.file-transfer-section,
-.received-files-section {
-
-  margin-bottom: 20px;
-
-  padding: 15px;
-
-  border: 1px solid #eee;
-
-  border-radius: 8px;
-
-}
-
-h2,
-h3 {
-
-  color: #333;
-
-}
-
-input[type="file"] {
-
-  margin: 10px 0;
-
-}
-
-button {
-
-  background-color: #4CAF50;
-
-  color: white;
-
-  padding: 10px 15px;
-
-  border: none;
-
-  border-radius: 4px;
-
-  cursor: pointer;
-
-}
-
-button:disabled {
-
-  background-color: #cccccc;
-
-  cursor: not-allowed;
-
-}
-
-.file-info {
-
-  margin: 10px 0;
-
-}
-
-.progress-container {
-
-  height: 20px;
-
-  background-color: #f0f0f0;
-
-  border-radius: 10px;
-
-  margin: 10px 0;
-
-  position: relative;
-
-}
-
-.progress-bar {
-
-  height: 100%;
-
-  background-color: #4CAF50;
-
-  border-radius: 10px;
-
-  transition: width 0.3s;
-
-}
-
-.progress-text,
-.speed-indicator {
-
-  position: absolute;
-
-  top: 0;
-
-  color: #333;
-
-  font-size: 12px;
-
-  line-height: 20px;
-
-}
-
-.progress-text {
-
-  left: 10px;
-
-}
-
-.speed-indicator {
-
-  right: 10px;
-
-}
-
-.error-message {
-
-  color: #ff0000;
-
-}
-
-.transfer-stats {
-
-  margin-top: 10px;
-
-  font-size: 14px;
-
-}
-
-.file-list {
-
-  margin-top: 10px;
-
-}
-
-.file-item {
-
-  margin-bottom: 10px;
-
-  padding: 10px;
-
-  border: 1px solid #ddd;
-
-  border-radius: 4px;
-
-}
-
-.file-header {
-
+.connection-status {
   display: flex;
-
   justify-content: space-between;
-
-  margin-bottom: 5px;
-
-}
-
-.file-progress {
-
-  height: 10px;
-
-  background-color: #f0f0f0;
-
+  margin-bottom: 20px;
+  padding: 10px;
+  background-color: #f8f9fa;
   border-radius: 5px;
-
-  position: relative;
-
-}
-
-.download-btn {
-
-  color: white;
-
-  background-color: #2196F3;
-
-  padding: 3px 8px;
-
-  border-radius: 3px;
-
-  text-decoration: none;
-
 }
 
 .connected {
@@ -1459,5 +1245,148 @@ button:disabled {
 
 .disconnected {
   color: red;
+}
+
+.file-transfer-section,
+.received-files-section {
+  margin-bottom: 20px;
+  padding: 15px;
+  border: 1px solid #eee;
+  border-radius: 8px;
+}
+
+h2, h3 {
+  color: #333;
+  margin-top: 0;
+}
+
+input[type="file"] {
+  margin: 10px 0;
+  padding: 5px;
+}
+
+button {
+  background-color: #4CAF50;
+  color: white;
+  padding: 10px 15px;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.3s;
+}
+
+button:disabled {
+  background-color: #cccccc;
+  cursor: not-allowed;
+}
+
+button:hover:not(:disabled) {
+  background-color: #45a049;
+}
+
+.file-info {
+  margin: 10px 0;
+}
+
+.progress-container {
+  height: 20px;
+  background-color: #f0f0f0;
+  border-radius: 10px;
+  margin: 10px 0;
+  position: relative;
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background-color: #4CAF50;
+  border-radius: 10px;
+  transition: width 0.3s;
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+.progress-text,
+.speed-indicator {
+  position: absolute;
+  top: 0;
+  color: #333;
+  font-size: 12px;
+  line-height: 20px;
+  padding: 0 10px;
+  z-index: 1;
+}
+
+.progress-text {
+  left: 0;
+}
+
+.speed-indicator {
+  right: 0;
+}
+
+.error-message {
+  color: #ff0000;
+  margin: 10px 0;
+}
+
+.file-list {
+  margin-top: 10px;
+}
+
+.file-item {
+  margin-bottom: 10px;
+  padding: 10px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  transition: box-shadow 0.3s;
+}
+
+.file-item:hover {
+  box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+}
+
+.file-header {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 5px;
+}
+
+.file-name {
+  font-weight: bold;
+}
+
+.file-progress {
+  height: 10px;
+  background-color: #f0f0f0;
+  border-radius: 5px;
+  position: relative;
+  overflow: hidden;
+}
+
+.download-btn {
+  color: white;
+  background-color: #2196F3;
+  padding: 3px 8px;
+  border-radius: 3px;
+  text-decoration: none;
+  font-size: 12px;
+  transition: background-color 0.3s;
+}
+
+.download-btn:hover {
+  background-color: #0b7dda;
+}
+
+.file-error {
+  color: #ff0000;
+  font-size: 12px;
+  margin-top: 5px;
+}
+
+.empty-message {
+  color: #666;
+  font-style: italic;
 }
 </style>
