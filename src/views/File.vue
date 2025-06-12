@@ -69,6 +69,10 @@ function setupWebSocket() {
   ws = new WebSocket('ws://59.110.35.198/wgk/ws/file')
 
   ws.onopen = () => {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
     console.log('[WebSocket] 连接成功')
     startHeartbeat()
   }
@@ -186,6 +190,7 @@ onMounted(() => {
   font-family: Arial, sans-serif;
   padding: 2rem;
 }
+
 progress {
   width: 100%;
   height: 20px;
