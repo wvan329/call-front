@@ -65,51 +65,78 @@ function stopHeartbeat() {
 }
 
 function setupWebSocket() {
-  if (ws) ws.close()
-  ws = new WebSocket('ws://59.110.35.198/wgk/ws/file')
+  return new Promise((resolve) => {
+    if (ws) ws.close()
+    ws = new WebSocket('ws://59.110.35.198/wgk/ws/file')
 
-  ws.onopen = () => {
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer)
-      reconnectTimer = null
+    ws.onopen = () => {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer)
+        reconnectTimer = null
+      }
+      console.log('[WebSocket] 连接成功')
+      startHeartbeat()
+      resolve()
     }
-    console.log('[WebSocket] 连接成功')
-    startHeartbeat()
-  }
 
-  ws.onmessage = async (event) => {
-    if (event.data === 'pong') return // 心跳回复忽略
-    const msg = JSON.parse(event.data)
-    // WebRTC 信令处理（略）
-  }
+    ws.onmessage = async (event) => {
+      if (event.data === 'pong') return
+      const msg = JSON.parse(event.data)
+      if (msg.type === 'answer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.answer))
+      } else if (msg.type === 'candidate') {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate))
+        } catch (e) {
+          console.error('ICE candidate error:', e)
+        }
+      } else if (msg.type === 'fileMeta') {
+        setupReceiverChannels(msg)
+      } else if (msg.type === 'offer') {
+        // 被动接收方
+        pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:59.110.35.198:3478' }] })
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.offer))
+        const answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        ws.send(JSON.stringify({ type: 'answer', answer }))
+      }
+    }
 
-  ws.onclose = () => {
-    console.warn('[WebSocket] 断开，3秒后重连')
-    stopHeartbeat()
-    reconnectTimer = setTimeout(() => setupWebSocket(), 3000)
-  }
+    ws.onclose = () => {
+      console.warn('[WebSocket] 断开，3秒后重连')
+      stopHeartbeat()
+      reconnectTimer = setTimeout(() => setupWebSocket(), 3000)
+    }
 
-  ws.onerror = (err) => {
-    console.error('[WebSocket] 错误:', err)
-    ws.close()
-  }
+    ws.onerror = (err) => {
+      console.error('[WebSocket] 错误:', err)
+      ws.close()
+    }
+  })
 }
+
 
 
 const startTransfer = async () => {
   if (!ws || ws.readyState >= WebSocket.CLOSING) {
-    setupWebSocket()
-    await waitForSocketOpen(ws)
+    await setupWebSocket()
   }
 
   pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:59.110.35.198:3478' }] })
+
   const channels = []
   for (let i = 0; i < CHANNEL_COUNT; i++) {
     const ch = pc.createDataChannel(`ch-${i}`, { ordered: true, reliable: true })
     ch.binaryType = 'arraybuffer'
     channels.push(ch)
   }
-  pc.onicecandidate = (e) => e.candidate && ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }))
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }))
+    }
+  }
+
   const offer = await pc.createOffer()
   await pc.setLocalDescription(offer)
   ws.send(JSON.stringify({ type: 'offer', offer }))
@@ -117,10 +144,15 @@ const startTransfer = async () => {
   let opened = 0
   channels.forEach((ch) => {
     ch.onopen = () => {
-      if (++opened === channels.length) sendFileParallel(channels)
+      opened++
+      if (opened === channels.length) {
+        console.log('🟢 所有通道已打开，开始发送')
+        sendFileParallel(channels)
+      }
     }
   })
 }
+
 
 const sendFileParallel = async (channels) => {
   const f = file.value
