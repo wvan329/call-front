@@ -13,7 +13,8 @@
 
     <div v-if="downloadUrl">
       <p>接收文件: <a :href="downloadUrl" :download="fileName">点击下载 {{ fileName }}</a></p>
-      <p>接收进度: {{ downloadProgress }}%</p>
+      <p>接收进度: {{ downloadProgress }}%, 接收速率: {{ downloadSpeed }}</p>
+      <progress :value="downloadProgress" max="100"></progress>
     </div>
   </div>
 </template>
@@ -23,10 +24,11 @@ import { ref, onMounted } from 'vue'
 
 const file = ref(null)
 const progress = ref(0)
-const speed = ref('0 B/s')
+const speed = ref('0 MB/s')
 const downloadUrl = ref('')
 const fileName = ref('')
 const downloadProgress = ref(0)
+const downloadSpeed = ref('0 MB/s')
 
 let ws
 let pc
@@ -85,6 +87,7 @@ const waitForSocketOpen = (socket) => {
     }
   })
 }
+
 function setupWebSocket() {
   ws = new WebSocket('ws://59.110.35.198/wgk/ws/file')
 
@@ -92,7 +95,6 @@ function setupWebSocket() {
     const msg = JSON.parse(event.data)
 
     if (msg.type === 'offer') {
-      // 作为接收方
       pc = new RTCPeerConnection({
         iceServers: [{ urls: 'stun:59.110.35.198:3478' }]
       })
@@ -135,7 +137,6 @@ function sendFile(file) {
   lastBytes = 0
   startTime = Date.now()
 
-  // 发送文件信息
   dataChannel.send(
     JSON.stringify({
       type: 'fileInfo',
@@ -154,11 +155,10 @@ function sendFile(file) {
     offset += e.target.result.byteLength
     sentBytes += e.target.result.byteLength
 
-    // 更新进度和速率
     const now = Date.now()
     const timeDiff = (now - lastTime) / 1000
     const byteDiff = sentBytes - lastBytes
-    speed.value = (byteDiff / timeDiff / 1024).toFixed(2) + ' KB/s'
+    speed.value = (byteDiff / timeDiff / 1024 / 1024).toFixed(2) + ' MB/s'
     lastTime = now
     lastBytes = sentBytes
     progress.value = ((sentBytes / totalSize) * 100).toFixed(2)
@@ -189,6 +189,7 @@ function receiveFile(channel) {
   let receivedBytes = 0
   let expectedSize = 0
   let name = ''
+  let start = null
 
   channel.onmessage = (event) => {
     if (typeof event.data === 'string') {
@@ -197,6 +198,7 @@ function receiveFile(channel) {
         expectedSize = msg.fileSize
         name = msg.fileName
         fileName.value = name
+        start = Date.now()
       } else if (msg.type === 'done') {
         const blob = new Blob(receivedBuffers)
         const url = URL.createObjectURL(blob)
@@ -206,6 +208,14 @@ function receiveFile(channel) {
       receivedBuffers.push(event.data)
       receivedBytes += event.data.byteLength
       downloadProgress.value = ((receivedBytes / expectedSize) * 100).toFixed(2)
+
+      if (start) {
+        const elapsed = (Date.now() - start) / 1000
+        if (elapsed > 0) {
+          const rate = (receivedBytes / 1024 / 1024) / elapsed
+          downloadSpeed.value = rate.toFixed(2) + ' MB/s'
+        }
+      }
     }
   }
 }
