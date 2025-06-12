@@ -2,8 +2,8 @@
   <div id="app">
     <h1>高速 P2P 大文件传输</h1>
 
-    <input type="file" @change="onFileChange" v-if="!file" />
-    <button @click="startTransfer" :disabled="!file || sending || !wsConnected">开始传输</button>
+    <input type="file" @change="onFileChange" />
+    <button @click="startTransfer" :disabled="!file"> 开始传输 </button>
 
     <div v-if="file">
       <p>文件名: {{ file.name }}</p>
@@ -11,12 +11,13 @@
       <progress :value="progress" max="100"></progress>
     </div>
 
-    <hr />
+    <div v-if="pendingMeta && !writer">
+      <p>接收文件: {{ pendingMeta.name }}</p>
+      <button @click="startReceiving">选择保存地方，开始接收</button>
+    </div>
 
-    <button v-if="!receiving && !receiverReady" @click="prepareReceive" :disabled="!wsConnected">准备接收文件</button>
-
-    <div v-if="receiving || receiverReady">
-      <p>接收文件: {{ fileName }}</p>
+    <div v-if="writer">
+      <p>正在接收: {{ fileName }}</p>
       <p>接收进度: {{ downloadProgress }}%</p>
       <progress :value="downloadProgress" max="100"></progress>
     </div>
@@ -30,12 +31,12 @@ const file = ref(null)
 const progress = ref(0)
 const downloadProgress = ref(0)
 const receiving = ref(false)
-const receiverReady = ref(false)
 const fileName = ref('')
-const wsConnected = ref(false)
+const pendingMeta = ref(null)
+
 let ws, pc
-const SLICE_SIZE = 512 * 1024
-const CHANNEL_COUNT = 4
+let SLICE_SIZE = 512 * 1024
+let CHANNEL_COUNT = 4
 
 let writer = null
 let sliceSize = 0
@@ -46,10 +47,9 @@ const onFileChange = (e) => {
   file.value = e.target.files[0]
 }
 
-const waitForSocketOpen = (ws) =>
-  new Promise((resolve) => {
-    ws.readyState === WebSocket.OPEN ? resolve() : (ws.onopen = resolve)
-  })
+const waitForSocketOpen = (ws) => new Promise((resolve) => {
+  ws.readyState === WebSocket.OPEN ? resolve() : (ws.onopen = resolve)
+})
 
 let heartbeatTimer = null
 let reconnectTimer = null
@@ -81,7 +81,6 @@ function setupWebSocket() {
         reconnectTimer = null
       }
       console.log('[WebSocket] 连接成功')
-      wsConnected.value = true
       startHeartbeat()
       resolve()
     }
@@ -89,6 +88,7 @@ function setupWebSocket() {
     ws.onmessage = async (event) => {
       if (event.data === 'pong') return
       const msg = JSON.parse(event.data)
+
       if (msg.type === 'answer') {
         await pc.setRemoteDescription(new RTCSessionDescription(msg.answer))
       } else if (msg.type === 'candidate') {
@@ -98,42 +98,20 @@ function setupWebSocket() {
           console.error('ICE candidate error:', e)
         }
       } else if (msg.type === 'fileMeta') {
+        pendingMeta.value = msg
         fileName.value = msg.name
-        sliceSize = msg.sliceSize
-        totalSlices = msg.totalSlices
-        receiving.value = true
-        receivedCount = 0
-        downloadProgress.value = 0
-        console.log('[Receiver] 收到文件元信息', msg)
       } else if (msg.type === 'offer') {
-        // 被动接收方建立pc，回复answer
         pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:59.110.35.198:3478' }] })
-        pc.onicecandidate = (e) => {
-          if (e.candidate) {
-            ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }))
-          }
-        }
-        pc.ondatachannel = (event) => {
-          const channel = event.channel
-          channel.binaryType = 'arraybuffer'
-          channel.onmessage = onDataChannelMessage
-        }
         await pc.setRemoteDescription(new RTCSessionDescription(msg.offer))
         const answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
         ws.send(JSON.stringify({ type: 'answer', answer }))
-      } else if (msg.type === 'readyToReceive') {
-        // 发送端收到接收端准备好信号，开始发送文件
-        console.log('[Sender] 收到接收端准备信号，开始发送文件')
-        if (channels.length) {
-          sendFileParallel(channels)
-        }
+        setupReceiverChannels()
       }
     }
 
     ws.onclose = () => {
       console.warn('[WebSocket] 断开，3秒后重连')
-      wsConnected.value = false
       stopHeartbeat()
       reconnectTimer = setTimeout(() => setupWebSocket(), 3000)
     }
@@ -145,124 +123,95 @@ function setupWebSocket() {
   })
 }
 
-let channels = []
-
 const startTransfer = async () => {
-  if (!ws || ws.readyState >= WebSocket.CLOSING) {
-    await setupWebSocket()
-  }
-  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:59.110.35.198:3478' }] })
+  if (!ws || ws.readyState >= WebSocket.CLOSING) await setupWebSocket()
 
-  channels = []
+  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:59.110.35.198:3478' }] })
+  const channels = []
   const openPromises = []
 
   for (let i = 0; i < CHANNEL_COUNT; i++) {
     const ch = pc.createDataChannel(`ch-${i}`, { ordered: true, reliable: true })
     ch.binaryType = 'arraybuffer'
     channels.push(ch)
-
-    const p = new Promise((resolve) => {
-      ch.onopen = () => {
-        console.log(`[DataChannel] ${ch.label} opened`)
-        resolve()
-      }
-      ch.onclose = () => {
-        console.log(`[DataChannel] ${ch.label} closed`)
-      }
-    })
-    openPromises.push(p)
+    openPromises.push(new Promise((resolve) => ch.onopen = resolve))
   }
 
-  pc.onicecandidate = (e) => {
-    if (e.candidate) {
-      ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }))
-    }
-  }
+  pc.onicecandidate = (e) => e.candidate && ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }))
 
   const offer = await pc.createOffer()
   await pc.setLocalDescription(offer)
   ws.send(JSON.stringify({ type: 'offer', offer }))
 
   await Promise.all(openPromises)
-  console.log('🟢 所有通道都 open，等待接收端准备信号')
-  // 注意：这里不发文件，等待接收端点击准备
+  sendFileParallel(channels)
 }
 
 const sendFileParallel = async (channels) => {
   const f = file.value
   const total = Math.ceil(f.size / SLICE_SIZE)
   let sent = 0
-  progress.value = 0
 
-  ws.send(
-    JSON.stringify({
-      type: 'fileMeta',
-      name: f.name,
-      size: f.size,
-      sliceSize: SLICE_SIZE,
-      totalSlices: total,
-      channelCount: channels.length,
-    })
-  )
+  ws.send(JSON.stringify({
+    type: 'fileMeta',
+    name: f.name,
+    size: f.size,
+    sliceSize: SLICE_SIZE,
+    totalSlices: total,
+    channelCount: channels.length
+  }))
 
   for (let i = 0; i < total; i++) {
     const start = i * SLICE_SIZE
     const end = Math.min(f.size, start + SLICE_SIZE)
-    const blob = f.slice(start, end)
-    const buffer = await blob.arrayBuffer()
-
+    const buffer = await f.slice(start, end).arrayBuffer()
     const header = new Uint32Array([i])
     const payload = new Uint8Array(header.byteLength + buffer.byteLength)
     payload.set(new Uint8Array(header.buffer), 0)
     payload.set(new Uint8Array(buffer), header.byteLength)
-
     const ch = channels[i % channels.length]
-
-    if (ch.readyState === 'open') {
-      ch.send(payload)
-    } else {
-      console.warn(`[WARN] Channel ${ch.label} 不是 open 状态，跳过该片段`)
-    }
-
+    if (ch.readyState === 'open') ch.send(payload)
     sent++
     progress.value = ((sent / total) * 100).toFixed(2)
   }
-  console.log('✅ 文件发送完成')
 }
 
-const prepareReceive = async () => {
+const setupReceiverChannels = () => {
+  pc.ondatachannel = (event) => {
+    const channel = event.channel
+    channel.binaryType = 'arraybuffer'
+    channel.onmessage = async (event) => {
+      if (!writer) return
+      const buf = event.data
+      const view = new DataView(buf)
+      const index = view.getUint32(0, false)
+      const data = buf.slice(4)
+      await writer.write({ type: 'write', position: index * sliceSize, data })
+      receivedCount++
+      downloadProgress.value = ((receivedCount / totalSlices) * 100).toFixed(2)
+      if (receivedCount === totalSlices) {
+        await writer.close()
+        writer = null
+        pendingMeta.value = null
+        alert('✅ 文件接收完成')
+      }
+    }
+  }
+}
+
+const startReceiving = async () => {
   try {
+    const meta = pendingMeta.value
     const handle = await window.showSaveFilePicker({
-      suggestedName: fileName.value || 'downloaded_file',
+      suggestedName: meta.name
     })
     const stream = await handle.createWritable()
     writer = stream.getWriter()
-
-    ws.send(JSON.stringify({ type: 'readyToReceive' }))
-    receiverReady.value = true
+    sliceSize = meta.sliceSize
+    totalSlices = meta.totalSlices
+    receivedCount = 0
   } catch (e) {
-    console.error('用户取消保存', e)
-  }
-}
-
-const onDataChannelMessage = async (event) => {
-  const buf = event.data
-  const view = new DataView(buf)
-  const index = view.getUint32(0, false)
-  const data = buf.slice(4)
-  if (!writer) {
-    console.warn('[Receiver] 写入流未准备好，丢弃数据')
-    return
-  }
-  await writer.write({ type: 'write', position: index * sliceSize, data })
-  receivedCount++
-  downloadProgress.value = ((receivedCount / totalSlices) * 100).toFixed(2)
-
-  if (receivedCount === totalSlices) {
-    await writer.close()
-    receiving.value = false
-    receiverReady.value = false
-    alert('✅ 文件接收完成')
+    console.error('❌ 选择保存失败', e)
   }
 }
 
@@ -278,7 +227,6 @@ onMounted(() => {
   font-family: Arial, sans-serif;
   padding: 2rem;
 }
-
 progress {
   width: 100%;
   height: 20px;
