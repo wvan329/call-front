@@ -1,6 +1,6 @@
 <template>
   <div id="app">
-    <h1>高速 P2P 大文件传输</h1>
+    <h1>高速 P2P 大文件传输11</h1>
 
     <input type="file" @change="onFileChange" />
     <button @click="startTransfer" :disabled="!file">开始传输</button>
