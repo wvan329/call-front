@@ -2,12 +2,12 @@
   <div id="app">
     <h1>高速 P2P 大文件传输</h1>
 
-    <div v-if="!file && !receiving && !incomingFileMeta">
+    <div v-if="!receiving && !incomingFileMeta">
       <input type="file" @change="onFileChange" />
       <button @click="startTransfer" :disabled="!file">开始传输</button>
     </div>
 
-    <div v-if="file">
+    <div v-if="file && !receiving">
       <p>发送文件: {{ file.name }}</p>
       <p>发送进度: {{ progress }}%</p>
       <progress :value="progress" max="100"></progress>
@@ -26,6 +26,7 @@
     </div>
   </div>
 </template>
+
 
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
