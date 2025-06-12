@@ -2,22 +2,6 @@
   <div class="webrtc-file-transfer-container">
     <h2>WebRTC 文件传输</h2>
 
-    <!-- <div class="connection-info">
-      <h3>连接状态</h3>
-      <p>我的会话ID: <span class="my-id">{{ mySessionId || '未连接' }}</span></p>
-      <p>WebSocket 状态:
-        <span :class="wsStatus.class">{{ wsStatus.text }}</span>
-      </p>
-      <p>在线数: <span class="connected-peers-count">{{ activePeersCount }}</span></p>
-      <p>传输速度: <span class="transfer-speed">{{ formatSpeed(currentSendSpeed) }}</span></p>
-      <p v-if="adaptiveInfo.enabled">动态速率控制:
-        <span class="adaptive-info">
-          阻塞率: {{ (adaptiveInfo.congestionRate * 100).toFixed(1) }}% |
-          动态块大小: {{ formatBytes(adaptiveInfo.currentChunkSize) }}
-        </span>
-      </p>
-    </div> -->
-
     <div class="file-transfer-section">
       <h3>文件发送</h3>
       <input type="file" @change="handleFileSelection" ref="fileInput" />
@@ -52,7 +36,7 @@
           </div>
           <div class="file-progress">
             <div class="progress-bar" :style="{ width: file.progress + '%' }"></div>
-            <span class="progress-text">{{ file.progress.toFixed(1) }}%</span>
+            <span class="progress-text">{{ file.progress.toFixed(2) }}%</span>
           </div>
         </div>
       </div>
