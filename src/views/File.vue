@@ -1,6 +1,6 @@
 <template>
   <div id="app">
-    <h1>大文件传输</h1>
+    <h1>高速传输</h1>
 
     <input type="file" @change="onFileChange" />
     <button @click="startTransfer" :disabled="!file || isSending">开始传输</button>
@@ -42,7 +42,7 @@ let heartbeatTimer = null
 let reconnectTimer = null
 
 let offset = 0
-const chunkSize = 64 * 1024
+const chunkSize = 128 * 1024
 const reader = new FileReader()
 
 function onFileChange(e) {
@@ -311,3 +311,4 @@ progress {
   height: 20px;
 }
 </style>
+
