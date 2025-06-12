@@ -62,7 +62,7 @@ const startTransfer = async () => {
   })
 
   dataChannel.binaryType = 'arraybuffer'
-  dataChannel.bufferedAmountLowThreshold = 64 * 1024
+  dataChannel.bufferedAmountLowThreshold = 128 * 1024
 
   dataChannel.onopen = () => {
     sendFile(file.value)
