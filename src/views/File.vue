@@ -45,26 +45,52 @@ const waitForSocketOpen = (ws) => new Promise((resolve) => {
   ws.readyState === WebSocket.OPEN ? resolve() : (ws.onopen = resolve)
 })
 
-const setupWebSocket = () => {
-  ws = new WebSocket('ws://59.110.35.198/wgk/ws/file')
+let heartbeatTimer = null
+let reconnectTimer = null
 
-  ws.onmessage = async (e) => {
-    const msg = JSON.parse(e.data)
-    if (msg.type === 'fileMeta') setupReceiverChannels(msg)
-
-    if (msg.type === 'offer') {
-      pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:59.110.35.198:3478' }] })
-      pc.onicecandidate = (e) => e.candidate && ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }))
-      await pc.setRemoteDescription(new RTCSessionDescription(msg.offer))
-      const answer = await pc.createAnswer()
-      await pc.setLocalDescription(answer)
-      ws.send(JSON.stringify({ type: 'answer', answer }))
+function startHeartbeat() {
+  stopHeartbeat()
+  heartbeatTimer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send('ping')
     }
+  }, 20000) // 每 20 秒心跳
+}
 
-    if (msg.type === 'answer') await pc.setRemoteDescription(new RTCSessionDescription(msg.answer))
-    if (msg.type === 'candidate') await pc.addIceCandidate(new RTCIceCandidate(msg.candidate))
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer)
+    heartbeatTimer = null
   }
 }
+
+function setupWebSocket() {
+  if (ws) ws.close()
+  ws = new WebSocket('ws://59.110.35.198/wgk/ws/file')
+
+  ws.onopen = () => {
+    console.log('[WebSocket] 连接成功')
+    startHeartbeat()
+  }
+
+  ws.onmessage = async (event) => {
+    if (event.data === 'pong') return // 心跳回复忽略
+    const msg = JSON.parse(event.data)
+    // WebRTC 信令处理（略）
+  }
+
+  ws.onclose = () => {
+    console.warn('[WebSocket] 断开，3秒后重连')
+    stopHeartbeat()
+    reconnectTimer = setTimeout(() => setupWebSocket(), 3000)
+  }
+
+  ws.onerror = (err) => {
+    console.error('[WebSocket] 错误:', err)
+    ws.close()
+  }
+}
+
 
 const startTransfer = async () => {
   if (!ws || ws.readyState >= WebSocket.CLOSING) {
