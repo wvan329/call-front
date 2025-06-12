@@ -125,10 +125,22 @@ const startTransfer = async () => {
   pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:59.110.35.198:3478' }] })
 
   const channels = []
+
+  // 创建多个 DataChannel，并用 promise 确保都打开
+  const openPromises = []
+
   for (let i = 0; i < CHANNEL_COUNT; i++) {
     const ch = pc.createDataChannel(`ch-${i}`, { ordered: true, reliable: true })
     ch.binaryType = 'arraybuffer'
     channels.push(ch)
+
+    const p = new Promise((resolve) => {
+      ch.onopen = () => {
+        console.log(`[DataChannel] ${ch.label} opened`)
+        resolve()
+      }
+    })
+    openPromises.push(p)
   }
 
   pc.onicecandidate = (e) => {
@@ -141,16 +153,10 @@ const startTransfer = async () => {
   await pc.setLocalDescription(offer)
   ws.send(JSON.stringify({ type: 'offer', offer }))
 
-  let opened = 0
-  channels.forEach((ch) => {
-    ch.onopen = () => {
-      opened++
-      if (opened === channels.length) {
-        console.log('🟢 所有通道已打开，开始发送')
-        sendFileParallel(channels)
-      }
-    }
-  })
+  // 等所有通道都打开才开始发送
+  await Promise.all(openPromises)
+  console.log('🟢 所有通道都 open，开始并行发送')
+  sendFileParallel(channels)
 }
 
 
@@ -158,22 +164,42 @@ const sendFileParallel = async (channels) => {
   const f = file.value
   const total = Math.ceil(f.size / SLICE_SIZE)
   let sent = 0
-  ws.send(JSON.stringify({ type: 'fileMeta', name: f.name, size: f.size, sliceSize: SLICE_SIZE, totalSlices: total, channelCount: channels.length }))
+
+  // 发送文件元信息
+  ws.send(JSON.stringify({
+    type: 'fileMeta',
+    name: f.name,
+    size: f.size,
+    sliceSize: SLICE_SIZE,
+    totalSlices: total,
+    channelCount: channels.length
+  }))
 
   for (let i = 0; i < total; i++) {
     const start = i * SLICE_SIZE
     const end = Math.min(f.size, start + SLICE_SIZE)
     const blob = f.slice(start, end)
     const buffer = await blob.arrayBuffer()
+
     const header = new Uint32Array([i])
     const payload = new Uint8Array(header.byteLength + buffer.byteLength)
     payload.set(new Uint8Array(header.buffer), 0)
     payload.set(new Uint8Array(buffer), header.byteLength)
-    channels[i % channels.length].send(payload)
+
+    const ch = channels[i % channels.length]
+
+    // 保险处理：确保 channel 处于 open 状态
+    if (ch.readyState === 'open') {
+      ch.send(payload)
+    } else {
+      console.warn(`[WARN] Channel ${ch.label} 不是 open 状态，跳过该片段`)
+    }
+
     sent++
     progress.value = ((sent / total) * 100).toFixed(2)
   }
 }
+
 
 const setupReceiverChannels = async (meta) => {
   fileName.value = meta.name
