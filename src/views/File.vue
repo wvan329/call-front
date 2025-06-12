@@ -210,8 +210,7 @@ const setupReceiverChannels = async (meta) => {
   downloadProgress.value = 0
 
   const handle = await window.showSaveFilePicker({
-    suggestedName: meta.name,
-    types: [{ description: 'All Files', accept: { '*/*': ['.*'] } }]
+    suggestedName: meta.name
   })
   const stream = await handle.createWritable()
   writer = stream.getWriter()
