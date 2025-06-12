@@ -11,6 +11,11 @@
       <progress :value="progress" max="100"></progress>
     </div>
 
+    <div v-if="incomingFileMeta">
+      <p>接收到文件: {{ incomingFileMeta.name }}</p>
+      <button @click="acceptIncomingFile">点击保存并开始接收</button>
+    </div>
+
     <div v-if="receiving">
       <p>接收文件: {{ fileName }}</p>
       <p>接收进度: {{ downloadProgress }}%</p>
@@ -27,10 +32,11 @@ const progress = ref(0)
 const downloadProgress = ref(0)
 const receiving = ref(false)
 const fileName = ref('')
+const incomingFileMeta = ref(null) // 用来保存收到的文件元信息，等待用户确认
 
 let ws, pc
-let SLICE_SIZE = 512 * 1024
-let CHANNEL_COUNT = 4
+const SLICE_SIZE = 512 * 1024
+const CHANNEL_COUNT = 4
 
 let writer = null
 let sliceSize = 0
@@ -41,9 +47,10 @@ const onFileChange = (e) => {
   file.value = e.target.files[0]
 }
 
-const waitForSocketOpen = (ws) => new Promise((resolve) => {
-  ws.readyState === WebSocket.OPEN ? resolve() : (ws.onopen = resolve)
-})
+const waitForSocketOpen = (ws) =>
+  new Promise((resolve) => {
+    ws.readyState === WebSocket.OPEN ? resolve() : (ws.onopen = resolve)
+  })
 
 let heartbeatTimer = null
 let reconnectTimer = null
@@ -54,7 +61,7 @@ function startHeartbeat() {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send('ping')
     }
-  }, 20000) // 每 20 秒心跳
+  }, 20000)
 }
 
 function stopHeartbeat() {
@@ -91,10 +98,12 @@ function setupWebSocket() {
           console.error('ICE candidate error:', e)
         }
       } else if (msg.type === 'fileMeta') {
-        setupReceiverChannels(msg)
+        // 收到文件元信息，先保存下来，等待用户确认
+        incomingFileMeta.value = msg
       } else if (msg.type === 'offer') {
-        // 被动接收方
-        pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:59.110.35.198:3478' }] })
+        pc = new RTCPeerConnection({
+          iceServers: [{ urls: 'stun:59.110.35.198:3478' }],
+        })
         await pc.setRemoteDescription(new RTCSessionDescription(msg.offer))
         const answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
@@ -115,8 +124,6 @@ function setupWebSocket() {
   })
 }
 
-
-
 const startTransfer = async () => {
   if (!ws || ws.readyState >= WebSocket.CLOSING) {
     await setupWebSocket()
@@ -125,8 +132,6 @@ const startTransfer = async () => {
   pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:59.110.35.198:3478' }] })
 
   const channels = []
-
-  // 创建多个 DataChannel，并用 promise 确保都打开
   const openPromises = []
 
   for (let i = 0; i < CHANNEL_COUNT; i++) {
@@ -134,13 +139,14 @@ const startTransfer = async () => {
     ch.binaryType = 'arraybuffer'
     channels.push(ch)
 
-    const p = new Promise((resolve) => {
-      ch.onopen = () => {
-        console.log(`[DataChannel] ${ch.label} opened`)
-        resolve()
-      }
-    })
-    openPromises.push(p)
+    openPromises.push(
+      new Promise((resolve) => {
+        ch.onopen = () => {
+          console.log(`[DataChannel] ${ch.label} opened`)
+          resolve()
+        }
+      })
+    )
   }
 
   pc.onicecandidate = (e) => {
@@ -153,27 +159,26 @@ const startTransfer = async () => {
   await pc.setLocalDescription(offer)
   ws.send(JSON.stringify({ type: 'offer', offer }))
 
-  // 等所有通道都打开才开始发送
   await Promise.all(openPromises)
   console.log('🟢 所有通道都 open，开始并行发送')
   sendFileParallel(channels)
 }
-
 
 const sendFileParallel = async (channels) => {
   const f = file.value
   const total = Math.ceil(f.size / SLICE_SIZE)
   let sent = 0
 
-  // 发送文件元信息
-  ws.send(JSON.stringify({
-    type: 'fileMeta',
-    name: f.name,
-    size: f.size,
-    sliceSize: SLICE_SIZE,
-    totalSlices: total,
-    channelCount: channels.length
-  }))
+  ws.send(
+    JSON.stringify({
+      type: 'fileMeta',
+      name: f.name,
+      size: f.size,
+      sliceSize: SLICE_SIZE,
+      totalSlices: total,
+      channelCount: channels.length,
+    })
+  )
 
   for (let i = 0; i < total; i++) {
     const start = i * SLICE_SIZE
@@ -187,12 +192,10 @@ const sendFileParallel = async (channels) => {
     payload.set(new Uint8Array(buffer), header.byteLength)
 
     const ch = channels[i % channels.length]
-
-    // 保险处理：确保 channel 处于 open 状态
     if (ch.readyState === 'open') {
       ch.send(payload)
     } else {
-      console.warn(`[WARN] Channel ${ch.label} 不是 open 状态，跳过该片段`)
+      console.warn(`[WARN] Channel ${ch.label} not open, skipping slice ${i}`)
     }
 
     sent++
@@ -200,8 +203,13 @@ const sendFileParallel = async (channels) => {
   }
 }
 
+// 新增：用户点击确认后调用，开始保存文件和接收数据
+const acceptIncomingFile = async () => {
+  if (!incomingFileMeta.value) return
 
-const setupReceiverChannels = async (meta) => {
+  const meta = incomingFileMeta.value
+  incomingFileMeta.value = null
+
   fileName.value = meta.name
   sliceSize = meta.sliceSize
   totalSlices = meta.totalSlices
@@ -210,7 +218,7 @@ const setupReceiverChannels = async (meta) => {
   downloadProgress.value = 0
 
   const handle = await window.showSaveFilePicker({
-    suggestedName: meta.name
+    suggestedName: meta.name,
   })
   const stream = await handle.createWritable()
   writer = stream.getWriter()
