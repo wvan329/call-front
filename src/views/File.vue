@@ -64,15 +64,18 @@ const INITIAL_BUFFER_LIMIT = 4 * 1024 * 1024; // 初始缓冲区限制 4MB
 const MIN_BUFFER_LIMIT = 1 * 1024 * 1024;     // 最小缓冲区限制 1MB
 const MAX_BUFFER_LIMIT = 32 * 1024 * 1024;    // 最大缓冲区限制 32MB
 
-// 超时设置
-const ACK_TIMEOUT = 5000;              // ACK超时时间(毫秒)
-const MAX_RETRIES = 15;                // 增加最大重试次数到15
-const HEARTBEAT_INTERVAL = 25000;      // WebSocket心跳间隔
-const CONNECTION_TIMEOUT = 30000;      // 连接超时时间
+// 超时设置 - 增加连接超时时间
+const ACK_TIMEOUT = 8000;              // 增加ACK超时时间到8秒
+const MAX_RETRIES = 25;                // 增加最大重试次数到25
+const HEARTBEAT_INTERVAL = 15000;      // 缩短WebSocket心跳间隔到15秒
+const CONNECTION_TIMEOUT = 60000;      // 增加连接超时时间到60秒
+
+// 自适应控制
+const HEARTBEAT_TIMEOUT = 30000;       // 心跳超时时间(毫秒)
 
 // 自适应控制
 const ADAPTIVE_INTERVAL = 500;         // 加快自适应参数调整间隔(毫秒)
-const CONGESTION_THRESHOLD = 0.5;      // 降低拥塞阈值
+const CONGESTION_THRESHOLD = 0.4;      // 降低拥塞阈值
 const UI_UPDATE_INTERVAL = 100;        // 加快UI更新间隔(毫秒)
 
 // 大文件处理参数
@@ -134,30 +137,30 @@ const calculateFileHash = async (file) => {
     const chunks = Math.ceil(file.size / chunkSize);
     let currentChunk = 0;
     const sha256Instance = sha256.create();
-    
+
     const loadNextChunk = () => {
       const start = currentChunk * chunkSize;
       const end = Math.min(start + chunkSize, file.size);
-      
+
       const reader = new FileReader();
       reader.onload = (e) => {
         sha256Instance.update(new Uint8Array(e.target.result));
         currentChunk++;
-        
+
         if (currentChunk < chunks) {
           loadNextChunk();
         } else {
           resolve(sha256Instance.hex());
         }
       };
-      
+
       reader.onerror = (e) => {
         reject(new Error(`计算哈希值失败: ${e.target.error.message}`));
       };
-      
+
       reader.readAsArrayBuffer(file.slice(start, end));
     };
-    
+
     loadNextChunk();
   });
 };
@@ -171,14 +174,14 @@ const handleFileSelection = (event) => {
   totalBytesSent.value = 0;
   currentSendSpeed.value = 0;
   isTransferring.value = false;
-  
+
   // 重置自适应参数
   isLargeFile.value = selectedFile.value && selectedFile.value.size > LARGE_FILE_THRESHOLD;
   currentChunkSize.value = isLargeFile.value ? LARGE_FILE_CHUNK_SIZE : INITIAL_CHUNK_SIZE;
   currentBufferLimit.value = isLargeFile.value ? LARGE_FILE_BUFFER_LIMIT : INITIAL_BUFFER_LIMIT;
   congestionRate.value = 0;
   recentBufferFullEvents.value = 0;
-  
+
   // 清理现有传输
   Object.keys(outgoingTransfers).forEach(fileId => {
     const transfer = outgoingTransfers[fileId];
@@ -216,7 +219,7 @@ const startFileTransfer = async () => {
 
   const file = selectedFile.value;
   const fileId = generateUniqueId();
-  
+
   // 计算文件哈希值
   let fileHash;
   try {
@@ -306,20 +309,20 @@ const createDataPacket = (fileId, chunkIndex, chunkData) => {
   // 数据包格式: [文件ID长度][文件ID][块索引][数据]
   const fileIdBytes = new TextEncoder().encode(fileId);
   const header = new Uint8Array(1 + fileIdBytes.length + 4);
-  
+
   let offset = 0;
   header[offset++] = fileIdBytes.length;
   header.set(fileIdBytes, offset);
   offset += fileIdBytes.length;
-  
+
   // 写入块索引
   new DataView(header.buffer).setUint32(offset, chunkIndex, true);
-  
+
   // 创建完整数据包
   const packet = new Uint8Array(header.length + chunkData.byteLength);
   packet.set(header, 0);
   packet.set(new Uint8Array(chunkData), header.length);
-  
+
   return packet.buffer;
 };
 
@@ -341,13 +344,13 @@ const processOutgoingQueue = async (fileId, peerId) => {
     transfer.lastBufferCheckTime = now;
     transfer.bufferFullEvents = 0;
   }
-  
+
   // 更严格的缓冲区检查 - 只在缓冲区使用低于70%时发送
   const bufferUsage = dc.bufferedAmount / currentBufferLimit.value;
   if (bufferUsage > 0.7) {
     transfer.bufferFullEvents++;
     recentBufferFullEvents.value++;
-    
+
     // 对于大文件，更保守地处理缓冲区
     if (transfer.isLargeFile && bufferUsage > 0.8) {
       // 使用指数退避策略，等待后再重试
@@ -395,7 +398,7 @@ const processOutgoingQueue = async (fileId, peerId) => {
             data: packet,
             peerId
           });
-          
+
           transfer.pendingAcks.set(nextChunkIndex, {
             timestamp: sendStartTime,
             retries: 0,
@@ -406,7 +409,7 @@ const processOutgoingQueue = async (fileId, peerId) => {
           transfer.bytesSent += slice.size;
           totalBytesSent.value += slice.size;
           transfer.chunksProcessed++;
-          
+
           // 更新估算进度（不依赖ACK）
           const now = Date.now();
           if (now - transfer.lastProgressUpdate > UI_UPDATE_INTERVAL) {
@@ -424,7 +427,7 @@ const processOutgoingQueue = async (fileId, peerId) => {
         } catch (sendError) {
           console.error(`向 ${peerId} 发送块 ${nextChunkIndex} 时出错:`, sendError);
           peerTransfer.consecutiveFailures++;
-          
+
           // 更智能的失败处理
           if (peerTransfer.consecutiveFailures > 3) {
             // 退避重试，避免立即重连
@@ -432,7 +435,7 @@ const processOutgoingQueue = async (fileId, peerId) => {
               peerTransfer.retryBackoff * 2,
               peerTransfer.maxRetryBackoff
             );
-            
+
             setTimeout(() => {
               peerTransfer.sendInProgress = false;
               peerTransfer.consecutiveFailures = 0;
@@ -524,7 +527,7 @@ const checkOverallTransferCompletion = (fileId) => {
     console.log(`文件传输完成: ${transfer.file.name} (${formatBytes(transfer.file.size)})`);
     console.log(`传输时间: ${(Date.now() - transfer.transferStartTime) / 1000} 秒`);
     console.log(`平均速度: ${formatSpeed(transfer.bytesSent / ((Date.now() - transfer.transferStartTime) / 1000))}`);
-    
+
     if (transfer.resolve) transfer.resolve();
   }
 };
@@ -532,12 +535,12 @@ const checkOverallTransferCompletion = (fileId) => {
 const handleChunkAck = (fileId, chunkIndex, peerId) => {
   const transfer = outgoingTransfers[fileId];
   if (!transfer) return;
-  
+
   const pendingAck = transfer.pendingAcks.get(chunkIndex);
   if (pendingAck) {
     // 计算RTT
     const rtt = Date.now() - pendingAck.timestamp;
-    
+
     // 更新传输统计
     const peerTransfer = transfer.peers[peerId];
     if (peerTransfer) {
@@ -545,10 +548,10 @@ const handleChunkAck = (fileId, chunkIndex, peerId) => {
       peerTransfer.consecutiveFailures = 0;
       peerTransfer.retryBackoff = 100; // 重置重试退避
     }
-    
+
     transfer.ackedChunks.add(chunkIndex);
     transfer.pendingAcks.delete(chunkIndex);
-    
+
     // 继续处理队列
     processOutgoingQueue(fileId, peerId);
   }
@@ -562,7 +565,7 @@ const updateSendProgress = () => {
   if (timeDiffSeconds >= (UI_UPDATE_INTERVAL / 1000)) {
     const bytesDiff = totalBytesSent.value - lastBytesSentForSpeed.value;
     currentSendSpeed.value = bytesDiff / timeDiffSeconds;
-    
+
     // 保存速度历史记录
     const currentTransfer = Object.values(outgoingTransfers).find(t => !t.isComplete);
     if (currentTransfer) {
@@ -570,13 +573,13 @@ const updateSendProgress = () => {
         time: now,
         speed: currentSendSpeed.value
       });
-      
+
       // 保留最近10秒的数据
       currentTransfer.speedHistory = currentTransfer.speedHistory.filter(
         entry => now - entry.time < 10000
       );
     }
-    
+
     lastBytesSentForSpeed.value = totalBytesSent.value;
     lastSpeedCalcTime.value = now;
   }
@@ -606,12 +609,12 @@ const updateSendProgress = () => {
 // --- 自适应传输参数调整 ---
 const adjustTransferParameters = () => {
   if (!isTransferring.value) return;
-  
+
   // 计算拥塞率
   const now = Date.now();
   congestionRate.value = recentBufferFullEvents.value / Math.max(1, Object.values(outgoingTransfers).length);
   recentBufferFullEvents.value = 0;
-  
+
   // 根据拥塞率调整传输参数
   if (congestionRate.value > CONGESTION_THRESHOLD) {
     // 高拥塞 - 减少块大小和缓冲区限制
@@ -634,7 +637,7 @@ const adjustTransferParameters = () => {
       Math.floor(currentBufferLimit.value * 1.05)
     );
   }
-  
+
   // 更新所有传输的块大小
   Object.values(outgoingTransfers).forEach(transfer => {
     if (!transfer.isComplete) {
@@ -646,22 +649,22 @@ const adjustTransferParameters = () => {
 // --- 重传机制 ---
 const checkAndRetransmit = () => {
   const now = Date.now();
-  
+
   for (const fileId in outgoingTransfers) {
     const transfer = outgoingTransfers[fileId];
     if (transfer.isComplete) continue;
-    
+
     transfer.pendingAcks.forEach((pendingAck, chunkIndex) => {
       // 检查ACK是否超时
       if (now - pendingAck.timestamp > ACK_TIMEOUT) {
         if (pendingAck.retries < MAX_RETRIES) {
           // 查找可以重传的对等端
           let retransmitted = false;
-          
+
           for (const peerId in transfer.peers) {
             const peer = peerConnections[peerId];
             if (!peer || peer.status !== 'connected') continue;
-            
+
             const dc = peer.dataChannel;
             if (dc?.readyState === 'open' && !transfer.peers[peerId].isPeerComplete) {
               try {
@@ -678,7 +681,7 @@ const checkAndRetransmit = () => {
               }
             }
           }
-          
+
           // 如果没有找到可用的对等端，增加重试计数
           if (!retransmitted) {
             pendingAck.retries++;
@@ -899,9 +902,26 @@ const closePeerConnection = (peerId) => {
   const peer = peerConnections[peerId];
   if (!peer) return;
 
+  // 清理心跳定时器
+  if (peer.heartbeatInterval) {
+    clearInterval(peer.heartbeatInterval);
+    peer.heartbeatInterval = null;
+  }
+
   // 关闭连接
   if (peer.connection) {
     peer.connection.close();
+  }
+
+  // 改进重连逻辑
+  if (isTransferring.value) {
+    console.log(`尝试重新连接到 ${peerId}...`);
+    setTimeout(() => {
+      if (peerConnections[peerId]?.status !== 'connected') {
+        createPeerConnection(peerId);
+        createOffer(peerId);
+      }
+    }, 3000);
   }
 
   // 清理状态
@@ -937,12 +957,24 @@ const closePeerConnection = (peerId) => {
 const setupDataChannel = (dc, peerId) => {
   const peer = peerConnections[peerId];
   peer.dataChannel = dc;
-  
+
   dc.onopen = () => {
     peer.status = 'connected';
     peer.lastActivity = Date.now();
     console.log(`与 ${peerId} 的数据通道已打开`);
-    
+
+    // 添加心跳机制
+    peer.heartbeatInterval = setInterval(() => {
+      if (dc.readyState === 'open') {
+        try {
+          dc.send(JSON.stringify({ type: 'ping' }));
+          peer.lastActivity = Date.now();
+        } catch (e) {
+          console.error(`发送心跳到 ${peerId} 时出错:`, e);
+        }
+      }
+    }, HEARTBEAT_INTERVAL);
+
     // 恢复进行中的传输
     Object.keys(outgoingTransfers).forEach(fileId => {
       const transfer = outgoingTransfers[fileId];
@@ -962,19 +994,19 @@ const setupDataChannel = (dc, peerId) => {
           maxRetryBackoff: 2000
         };
         transfer.peers[peerId] = peerTransfer;
-        
+
         // 发送元数据
-        sendMetaData(dc, fileId, transfer.file.name, transfer.file.size, 
-                    transfer.file.type || 'application/octet-stream', transfer.fileHash);
+        sendMetaData(dc, fileId, transfer.file.name, transfer.file.size,
+          transfer.file.type || 'application/octet-stream', transfer.fileHash);
         processOutgoingQueue(fileId, peerId);
       }
     });
   };
-  
+
   dc.onclose = () => {
     peer.status = 'disconnected';
     console.log(`与 ${peerId} 的数据通道已关闭`);
-    
+
     // 尝试重连
     if (isTransferring.value) {
       console.log(`尝试重新连接到 ${peerId}...`);
@@ -986,17 +1018,17 @@ const setupDataChannel = (dc, peerId) => {
       }, 3000);
     }
   };
-  
+
   dc.onerror = (error) => {
     console.error(`与 ${peerId} 的数据通道错误:`, error);
     closePeerConnection(peerId);
-    
+
     // 尝试重新连接
     if (isTransferring.value) {
       const now = Date.now();
       const peerTransfer = Object.values(outgoingTransfers)
         .find(t => !t.isComplete)?.peers[peerId];
-      
+
       if (!peerTransfer || now - (peerTransfer.lastConnectionAttempt || 0) > 10000) {
         console.log(`数据通道错误后尝试重新连接到 ${peerId}...`);
         setTimeout(() => {
@@ -1010,14 +1042,25 @@ const setupDataChannel = (dc, peerId) => {
       }
     }
   };
-  
+
   dc.onmessage = (event) => {
     peer.lastActivity = Date.now();
     peer.stats.messagesReceived++;
-    
+
     try {
       if (typeof event.data === 'string') {
         const msg = JSON.parse(event.data);
+        if (msg.type === 'ping') {
+          // 响应心跳
+          if (dc.readyState === 'open') {
+            dc.send(JSON.stringify({ type: 'pong' }));
+          }
+          return;
+        } else if (msg.type === 'pong') {
+          // 收到心跳响应
+          peer.lastActivity = Date.now();
+          return;
+        }
         handleDataChannelMessage(msg, peerId);
       } else {
         handleFileChunk(event.data, peerId);
@@ -1089,45 +1132,45 @@ const handleFileChunk = (data, peerId) => {
     // 解析头部
     const view = new DataView(data);
     let offset = 0;
-    
+
     const fileIdLength = view.getUint8(offset++);
     const fileId = new TextDecoder().decode(
       data.slice(offset, offset + fileIdLength)
     );
     offset += fileIdLength;
-    
+
     const chunkIndex = view.getUint32(offset, true);
     offset += 4;
-    
+
     // 提取数据
     const chunkData = data.slice(offset);
-    
+
     // 处理文件块
     const fileInfo = incomingFiles[fileId];
     if (!fileInfo) {
       console.warn(`收到未知文件的块: ${fileId}`);
       return;
     }
-    
+
     // 避免重复接收
     if (fileInfo.receivedChunks.has(chunkIndex)) {
       return;
     }
-    
+
     // 存储块
     fileInfo.receivedChunks.set(chunkIndex, chunkData);
     fileInfo.chunksReceived++;
-    
+
     // 更新进度
     const progress = Math.floor((fileInfo.chunksReceived / fileInfo.chunksCount) * 100);
     fileInfo.progress = progress;
-    
+
     // 更新UI
     const receivedFile = receivedFiles.find(f => f.id === fileId);
     if (receivedFile) {
       receivedFile.progress = progress;
     }
-    
+
     // 发送ACK
     const dc = peerConnections[peerId]?.dataChannel;
     if (dc?.readyState === 'open') {
@@ -1140,7 +1183,7 @@ const handleFileChunk = (data, peerId) => {
         }));
       }
     }
-    
+
     // 检查是否完成
     if (fileInfo.chunksReceived === fileInfo.chunksCount && !fileInfo.completed) {
       finalizeFile(fileId);
@@ -1162,12 +1205,12 @@ const handleTransferComplete = (fileId, peerId) => {
 const finalizeFile = async (fileId) => {
   const fileInfo = incomingFiles[fileId];
   if (!fileInfo) return;
-  
+
   try {
     // 按顺序组合块
     const chunks = [];
     let totalSize = 0;
-    
+
     // 先计算总大小
     for (let i = 0; i < fileInfo.chunksCount; i++) {
       const chunk = fileInfo.receivedChunks.get(i);
@@ -1176,20 +1219,20 @@ const finalizeFile = async (fileId) => {
       }
       totalSize += chunk.byteLength;
     }
-    
+
     // 创建ArrayBuffer并填充数据
     const buffer = new Uint8Array(totalSize);
     let position = 0;
-    
+
     for (let i = 0; i < fileInfo.chunksCount; i++) {
       const chunk = fileInfo.receivedChunks.get(i);
       buffer.set(new Uint8Array(chunk), position);
       position += chunk.byteLength;
     }
-    
+
     // 创建Blob
     const blob = new Blob([buffer], { type: fileInfo.type });
-    
+
     // 验证文件完整性
     if (fileInfo.hash) {
       const receivedHash = await calculateFileHash(blob);
@@ -1197,10 +1240,10 @@ const finalizeFile = async (fileId) => {
         throw new Error(`文件校验失败: 预期 ${fileInfo.hash}, 实际 ${receivedHash}`);
       }
     }
-    
+
     // 创建下载URL
     const url = URL.createObjectURL(blob);
-    
+
     // 更新UI
     const receivedFile = receivedFiles.find(f => f.id === fileId);
     if (receivedFile) {
@@ -1208,19 +1251,19 @@ const finalizeFile = async (fileId) => {
       receivedFile.url = url;
       receivedFile.size = blob.size;
     }
-    
+
     // 标记为已完成
     fileInfo.completed = true;
     fileInfo.fileData = blob;
-    
+
     // 清理临时数据
     delete incomingFiles[fileId];
-    
-    console.log(`文件 ${fileInfo.name} 接收成功，用时 ${(Date.now() - fileInfo.startTime)/1000} 秒`);
+
+    console.log(`文件 ${fileInfo.name} 接收成功，用时 ${(Date.now() - fileInfo.startTime) / 1000} 秒`);
     console.log(`原始大小: ${fileInfo.size}, 接收大小: ${blob.size}`);
   } catch (error) {
     console.error(`完成文件 ${fileInfo.name} 时出错:`, error);
-    
+
     // 更新UI显示错误
     const receivedFile = receivedFiles.find(f => f.id === fileId);
     if (receivedFile) {
@@ -1234,16 +1277,28 @@ const finalizeFile = async (fileId) => {
 const monitorConnections = () => {
   setInterval(() => {
     const now = Date.now();
-    
+
     Object.keys(peerConnections).forEach(peerId => {
       const peer = peerConnections[peerId];
-      
+
       // 检查数据通道活动
-      if (peer.status === 'connected' && 
-          peer.lastActivity && 
-          (now - peer.lastActivity) > CONNECTION_TIMEOUT) {
-        console.warn(`与 ${peerId} 超过 ${CONNECTION_TIMEOUT/1000} 秒无活动，关闭连接`);
+      if (peer.status === 'connected' &&
+        peer.lastActivity &&
+        (now - peer.lastActivity) > CONNECTION_TIMEOUT) {
+        console.warn(`与 ${peerId} 超过 ${CONNECTION_TIMEOUT / 1000} 秒无活动，关闭连接`);
         closePeerConnection(peerId);
+      } else if (peer.status === 'connected' &&
+        peer.lastActivity &&
+        (now - peer.lastActivity) > HEARTBEAT_TIMEOUT) {
+        // 心跳超时但未达到连接超时，尝试发送心跳检测
+        if (peer.dataChannel?.readyState === 'open') {
+          try {
+            peer.dataChannel.send(JSON.stringify({ type: 'ping' }));
+            console.log(`向 ${peerId} 发送心跳检测`);
+          } catch (e) {
+            console.error(`发送心跳检测到 ${peerId} 时出错:`, e);
+          }
+        }
       }
     });
   }, 10000);
@@ -1258,10 +1313,10 @@ let retransmissionIntervalId = null;
 const startTimers = () => {
   // UI更新定时器
   uiUpdateIntervalId = setInterval(updateSendProgress, UI_UPDATE_INTERVAL);
-  
+
   // 自适应参数调整定时器
   adaptiveIntervalId = setInterval(adjustTransferParameters, ADAPTIVE_INTERVAL);
-  
+
   // 重传定时器
   retransmissionIntervalId = setInterval(checkAndRetransmit, ACK_TIMEOUT / 2);
 };
@@ -1271,12 +1326,12 @@ const stopTimers = () => {
     clearInterval(uiUpdateIntervalId);
     uiUpdateIntervalId = null;
   }
-  
+
   if (adaptiveIntervalId) {
     clearInterval(adaptiveIntervalId);
     adaptiveIntervalId = null;
   }
-  
+
   if (retransmissionIntervalId) {
     clearInterval(retransmissionIntervalId);
     retransmissionIntervalId = null;
@@ -1370,7 +1425,8 @@ watchEffect(() => {
   border-radius: 8px;
 }
 
-h2, h3 {
+h2,
+h3 {
   color: #333;
   margin-top: 0;
 }
@@ -1459,7 +1515,7 @@ button:hover:not(:disabled) {
 }
 
 .file-item:hover {
-  box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
 }
 
 .file-header {
