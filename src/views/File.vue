@@ -7,13 +7,13 @@
 
     <div v-if="file">
       <p>文件名: {{ file.name }}</p>
-      <p>发送进度: {{ progress }}%, 速率: {{ speed }}</p>
+      <p>发送进度: {{ progress }}%</p>
       <progress :value="progress" max="100"></progress>
     </div>
 
     <div v-if="receiving || downloadUrl">
       <p>接收文件: <span>{{ fileName }}</span></p>
-      <p>接收进度: {{ downloadProgress }}%, 速率: {{ speed }}</p>
+      <p>接收进度: {{ downloadProgress }}%</p>
       <progress :value="downloadProgress" max="100"></progress>
 
       <div v-if="downloadUrl">
@@ -28,11 +28,9 @@ import { ref, onMounted } from 'vue'
 const receiving = ref(false) // 是否正在接收中
 const file = ref(null)
 const progress = ref(0)
-const speed = ref('0 MB/s')
 const downloadUrl = ref('')
 const fileName = ref('')
 const downloadProgress = ref(0)
-const downloadSpeed = ref('0 MB/s')
 
 let ws
 let pc
@@ -158,14 +156,6 @@ function sendFile(file) {
     dataChannel.send(e.target.result)
     offset += e.target.result.byteLength
     sentBytes += e.target.result.byteLength
-
-    const now = Date.now()
-    const timeDiff = (now - lastTime) / 1000
-    const byteDiff = sentBytes - lastBytes
-    if (timeDiff > 0) {
-      speed.value = (byteDiff / timeDiff / 1024 / 1024).toFixed(2) + ' MB/s'
-    }
-    lastTime = now
     lastBytes = sentBytes
     progress.value = ((sentBytes / totalSize) * 100).toFixed(2)
 
@@ -216,16 +206,6 @@ function receiveFile(channel) {
       receivedBuffers.push(event.data)
       receivedBytes += event.data.byteLength
       downloadProgress.value = ((receivedBytes / expectedSize) * 100).toFixed(2)
-
-      // 计算速率（可选）
-      const now = Date.now()
-      const timeDiff = (now - lastTimeRecv) / 1000
-      const byteDiff = receivedBytes - lastBytesRecv
-      if (timeDiff > 1) {
-        speed.value = (byteDiff / timeDiff / 1024 / 1024).toFixed(2) + ' MB/s'
-        lastTimeRecv = now
-        lastBytesRecv = receivedBytes
-      }
     }
   }
 }
