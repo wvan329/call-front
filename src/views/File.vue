@@ -11,17 +11,21 @@
       <progress :value="progress" max="100"></progress>
     </div>
 
-    <div v-if="downloadUrl">
-      <p>接收文件: <a :href="downloadUrl" :download="fileName">点击下载 {{ fileName }}</a></p>
-      <p>接收进度: {{ downloadProgress }}%, 接收速率: {{ downloadSpeed }}</p>
+    <div v-if="receiving || downloadUrl">
+      <p>接收文件: <span>{{ fileName }}</span></p>
+      <p>接收进度: {{ downloadProgress }}%, 速率: {{ speed }}</p>
       <progress :value="downloadProgress" max="100"></progress>
+
+      <div v-if="downloadUrl">
+        <p><a :href="downloadUrl" :download="fileName">点击下载 {{ fileName }}</a></p>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup>
 import { ref, onMounted } from 'vue'
-
+const receiving = ref(false) // 是否正在接收中
 const file = ref(null)
 const progress = ref(0)
 const speed = ref('0 MB/s')
@@ -191,7 +195,8 @@ function receiveFile(channel) {
   let receivedBytes = 0
   let expectedSize = 0
   let name = ''
-  let start = null
+  let lastTimeRecv = Date.now()
+  let lastBytesRecv = 0
 
   channel.onmessage = (event) => {
     if (typeof event.data === 'string') {
@@ -200,23 +205,26 @@ function receiveFile(channel) {
         expectedSize = msg.fileSize
         name = msg.fileName
         fileName.value = name
-        start = Date.now()
+        receiving.value = true // 立即显示 UI
       } else if (msg.type === 'done') {
         const blob = new Blob(receivedBuffers)
         const url = URL.createObjectURL(blob)
         downloadUrl.value = url
+        receiving.value = false
       }
     } else {
       receivedBuffers.push(event.data)
       receivedBytes += event.data.byteLength
       downloadProgress.value = ((receivedBytes / expectedSize) * 100).toFixed(2)
 
-      if (start) {
-        const elapsed = (Date.now() - start) / 1000
-        if (elapsed > 0) {
-          const rate = (receivedBytes / 1024 / 1024) / elapsed
-          downloadSpeed.value = rate.toFixed(2) + ' MB/s'
-        }
+      // 计算速率（可选）
+      const now = Date.now()
+      const timeDiff = (now - lastTimeRecv) / 1000
+      const byteDiff = receivedBytes - lastBytesRecv
+      if (timeDiff > 1) {
+        speed.value = (byteDiff / timeDiff / 1024 / 1024).toFixed(2) + ' MB/s'
+        lastTimeRecv = now
+        lastBytesRecv = receivedBytes
       }
     }
   }
