@@ -1,9 +1,9 @@
 <template>
   <div id="app">
-    <h1>大文件传输12</h1>
+    <h1>大文件传输</h1>
 
     <input type="file" @change="onFileChange" />
-    <button @click="startTransfer" :disabled="!file || sending">开始传输</button>
+    <button @click="startTransfer" :disabled="!file || isSending">开始传输</button>
 
     <div v-if="file">
       <p>文件名: {{ file.name }}</p>
@@ -26,26 +26,99 @@
 <script setup>
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 
-const file = ref(null)
-const progress = ref(0)
-const downloadProgress = ref(0)
-const fileName = ref('')
-const downloadUrl = ref('')
-const sending = ref(false)
-const receiving = ref(false)
+const receiving = ref(false)       // 是否正在接收
+const file = ref(null)             // 选中文件
+const progress = ref(0)            // 发送进度
+const downloadUrl = ref('')        // 接收端文件下载链接
+const fileName = ref('')           // 接收端文件名
+const downloadProgress = ref(0)    // 接收进度
+const isSending = ref(false)       // 是否正在发送，防止重复点
 
 let ws = null
 let pc = null
 let dataChannel = null
 
-let totalSize = 0
-let sentBytes = 0
+let heartbeatTimer = null
+let reconnectTimer = null
 
-// 初始化WebSocket和监听
-function setupWebSocket() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-    return
+let offset = 0
+const chunkSize = 64 * 1024
+const reader = new FileReader()
+
+function onFileChange(e) {
+  file.value = e.target.files[0]
+  progress.value = 0
+  downloadUrl.value = ''
+  downloadProgress.value = 0
+  fileName.value = ''
+}
+
+async function startTransfer() {
+  if (!file.value) return
+  isSending.value = true
+  progress.value = 0
+
+  if (!ws || ws.readyState >= WebSocket.CLOSING) {
+    await setupWebSocket()
   }
+
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:59.110.35.198:3478' }]
+  })
+
+  dataChannel = pc.createDataChannel('fileTransfer', {
+    ordered: true,
+    reliable: true
+  })
+
+  dataChannel.binaryType = 'arraybuffer'
+  dataChannel.bufferedAmountLowThreshold = 256 * 1024
+
+  dataChannel.onopen = () => {
+    console.log('[WebRTC] DataChannel打开，开始传输')
+    sendFile(file.value)
+  }
+
+  dataChannel.onbufferedamountlow = () => {
+    sendNextSlice()
+  }
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }))
+    }
+  }
+
+  const offer = await pc.createOffer()
+  await pc.setLocalDescription(offer)
+
+  ws.send(JSON.stringify({ type: 'offer', offer }))
+}
+
+function waitForSocketOpen(socket) {
+  return new Promise((resolve, reject) => {
+    if (socket.readyState === WebSocket.OPEN) {
+      resolve()
+    } else {
+      socket.onopen = () => resolve()
+      socket.onerror = (err) => reject(err)
+    }
+  })
+}
+
+async function setupWebSocket() {
+  if (ws) {
+    ws.onclose = null
+    ws.onerror = null
+    ws.onmessage = null
+    ws.close()
+  }
+
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+
   ws = new WebSocket('ws://59.110.35.198/wgk/ws/file')
 
   ws.onopen = () => {
@@ -53,57 +126,72 @@ function setupWebSocket() {
     startHeartbeat()
   }
 
-  ws.onmessage = async (event) => {
-    const msg = JSON.parse(event.data)
-    if (msg.type === 'offer') {
-      console.log('[WebRTC] 收到offer')
-      if (pc) pc.close()
-      pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:59.110.35.198:3478' }] })
+  ws.onclose = () => {
+    console.warn('[WebSocket] 断开，重连中...')
+    stopHeartbeat()
+    reconnectTimer = setTimeout(() => {
+      setupWebSocket()
+    }, 3000)
+  }
 
-      pc.onicecandidate = (e) => {
-        if (e.candidate) {
-          ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }))
-        }
+  ws.onerror = (err) => {
+    console.error('[WebSocket] 错误:', err)
+    ws.close()
+  }
+
+  ws.onmessage = async (event) => {
+    if (event.data === 'pong') {
+      // 心跳回复
+      return
+    }
+
+    let msg = null
+    try {
+      msg = JSON.parse(event.data)
+    } catch (e) {
+      console.error('消息解析失败', e)
+      return
+    }
+
+    if (msg.type === 'offer') {
+      console.log('[WebRTC] 收到offer，准备回应')
+
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:59.110.35.198:3478' }]
+      })
+
+      pc.ondatachannel = (event) => {
+        console.log('[WebRTC] 收到DataChannel')
+        receiveFile(event.channel)
       }
 
-      pc.ondatachannel = (e) => {
-        console.log('[WebRTC] 接收到数据通道')
-        receiving.value = true
-        receiveFile(e.channel)
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }))
+        }
       }
 
       await pc.setRemoteDescription(new RTCSessionDescription(msg.offer))
       const answer = await pc.createAnswer()
       await pc.setLocalDescription(answer)
       ws.send(JSON.stringify({ type: 'answer', answer }))
-    } else if (msg.type === 'answer') {
+    }
+
+    if (msg.type === 'answer') {
       console.log('[WebRTC] 收到answer')
       await pc.setRemoteDescription(new RTCSessionDescription(msg.answer))
-    } else if (msg.type === 'candidate') {
-      if (pc) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate))
-        } catch (e) {
-          console.warn('[WebRTC] candidate错误', e)
-        }
+    }
+
+    if (msg.type === 'candidate') {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(msg.candidate))
+      } catch (e) {
+        console.error('ICE candidate错误:', e)
       }
-    } else if (event.data === 'pong') {
-      // 心跳响应
     }
   }
 
-  ws.onclose = () => {
-    console.warn('[WebSocket] 断开，重连中...')
-    stopHeartbeat()
-    setTimeout(() => {
-      setupWebSocket()
-    }, 3000)
-  }
-
-  ws.onerror = (e) => {
-    console.error('[WebSocket] 错误', e)
-    ws.close()
-  }
+  await waitForSocketOpen(ws)
 }
 
 function startHeartbeat() {
@@ -112,7 +200,7 @@ function startHeartbeat() {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send('ping')
     }
-  }, 10000)
+  }, 20000)
 }
 
 function stopHeartbeat() {
@@ -122,144 +210,93 @@ function stopHeartbeat() {
   }
 }
 
-let heartbeatTimer = null
-
-const onFileChange = (e) => {
-  file.value = e.target.files[0]
-  progress.value = 0
-  downloadProgress.value = 0
-  downloadUrl.value = ''
-  fileName.value = ''
-}
-
-async function startTransfer() {
-  if (!file.value) return
-
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    console.log('WebSocket尚未连接，等待连接...')
-    await waitForSocketOpen()
-  }
-
-  sending.value = true
-  totalSize = file.value.size
-  sentBytes = 0
-  progress.value = 0
-
-  if (pc) pc.close()
-  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:59.110.35.198:3478' }] })
-
-  pc.onicecandidate = (e) => {
-    if (e.candidate) {
-      ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }))
-    }
-  }
-
-  dataChannel = pc.createDataChannel('fileTransfer', { ordered: true, reliable: true })
-  dataChannel.binaryType = 'arraybuffer'
-
-  dataChannel.onopen = () => {
-    console.log('[DataChannel] 通道打开，开始发送文件')
-    sendFile(file.value)
-  }
-  dataChannel.onerror = (e) => {
-    console.error('[DataChannel] 错误', e)
-  }
-  dataChannel.onclose = () => {
-    console.log('[DataChannel] 关闭')
-  }
-
-  const offer = await pc.createOffer()
-  await pc.setLocalDescription(offer)
-  ws.send(JSON.stringify({ type: 'offer', offer: pc.localDescription }))
-}
-
-function sendFile(file) {
-  const chunkSize = 64 * 1024
-  let offset = 0
-
-  dataChannel.send(JSON.stringify({ type: 'fileInfo', fileName: file.name, fileSize: file.size }))
-
-  const reader = new FileReader()
-
-  reader.onload = (e) => {
-    dataChannel.send(e.target.result)
-    offset += e.target.result.byteLength
-    sentBytes += e.target.result.byteLength
-    progress.value = ((sentBytes / totalSize) * 100).toFixed(2)
-
-    if (offset < file.size) {
-      if (dataChannel.bufferedAmount > dataChannel.bufferedAmountLowThreshold) {
-        dataChannel.onbufferedamountlow = () => {
-          dataChannel.onbufferedamountlow = null
-          sendNextChunk()
-        }
-      } else {
-        sendNextChunk()
-      }
-    } else {
-      dataChannel.send(JSON.stringify({ type: 'done' }))
-      sending.value = false
-      console.log('[发送完成]')
-    }
-  }
-
-  function sendNextChunk() {
-    const slice = file.slice(offset, offset + chunkSize)
-    reader.readAsArrayBuffer(slice)
-  }
-
-  sendNextChunk()
-}
+let receivedBuffers = []
+let expectedSize = 0
 
 function receiveFile(channel) {
-  let buffers = []
-  let receivedBytes = 0
-  let expectedSize = 0
-  let name = ''
+  receivedBuffers = []
+  expectedSize = 0
+  fileName.value = ''
+  downloadProgress.value = 0
+  receiving.value = true
 
   channel.onmessage = (event) => {
     if (typeof event.data === 'string') {
       const msg = JSON.parse(event.data)
       if (msg.type === 'fileInfo') {
         expectedSize = msg.fileSize
-        name = msg.fileName
-        fileName.value = name
-        receiving.value = true
+        fileName.value = msg.fileName
       } else if (msg.type === 'done') {
-        const blob = new Blob(buffers)
+        const blob = new Blob(receivedBuffers)
         downloadUrl.value = URL.createObjectURL(blob)
         receiving.value = false
-        console.log('[接收完成]')
       }
     } else {
-      buffers.push(event.data)
-      receivedBytes += event.data.byteLength
-      downloadProgress.value = ((receivedBytes / expectedSize) * 100).toFixed(2)
+      receivedBuffers.push(event.data)
+      let receivedBytes = receivedBuffers.reduce((sum, buf) => sum + buf.byteLength, 0)
+      downloadProgress.value = Number(((receivedBytes / expectedSize) * 100).toFixed(2))
     }
   }
 }
 
-function waitForSocketOpen() {
-  return new Promise((resolve, reject) => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      resolve()
-    } else {
-      if (!ws) setupWebSocket()
-      ws.onopen = () => resolve()
-      ws.onerror = (e) => reject(e)
+function sendFile(selectedFile) {
+  offset = 0
+  progress.value = 0
+
+  // 先发文件信息
+  if (dataChannel.readyState !== 'open') {
+    console.warn('[WebRTC] DataChannel未打开，无法发送文件信息')
+    return
+  }
+  dataChannel.send(
+    JSON.stringify({
+      type: 'fileInfo',
+      fileName: selectedFile.name,
+      fileSize: selectedFile.size
+    })
+  )
+  sendNextSlice()
+}
+
+function sendNextSlice() {
+  if (!file.value) return
+  if (offset >= file.value.size) {
+    if (dataChannel.readyState === 'open') {
+      dataChannel.send(JSON.stringify({ type: 'done' }))
+      console.log('[WebRTC] 文件传输完成')
+      isSending.value = false
     }
-  })
+    return
+  }
+
+  if (dataChannel.bufferedAmount > dataChannel.bufferedAmountLowThreshold) {
+    // 等待缓冲区降低事件触发
+    return
+  }
+
+  const slice = file.value.slice(offset, offset + chunkSize)
+  reader.readAsArrayBuffer(slice)
+}
+
+reader.onload = (e) => {
+  if (dataChannel && dataChannel.readyState === 'open') {
+    dataChannel.send(e.target.result)
+    offset += e.target.result.byteLength
+    progress.value = Number(((offset / file.value.size) * 100).toFixed(2))
+    sendNextSlice()
+  }
 }
 
 onMounted(() => {
   setupWebSocket()
 })
+
 onBeforeUnmount(() => {
   stopHeartbeat()
+  if (reconnectTimer) clearTimeout(reconnectTimer)
   if (ws) ws.close()
   if (pc) pc.close()
 })
-
 </script>
 
 <style>
