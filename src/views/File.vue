@@ -1,6 +1,6 @@
 <template>
   <div id="app">
-    <h1>大文件并行传输加速示例</h1>
+    <h1>大文件并行传输加速测试12</h1>
 
     <input type="file" @change="onFileChange" />
     <button @click="startTransfer" :disabled="!file || sending">开始传输</button>
@@ -40,8 +40,8 @@ let dataChannels = []
 let heartbeatTimer = null
 let reconnectTimer = null
 
-const NUM_CHANNELS = 4 // 并行通道数量
-const CHUNK_SIZE = 64 * 1024 // 64KB 分片大小
+const NUM_CHANNELS = 4
+const CHUNK_SIZE = 64 * 1024
 
 const onFileChange = (e) => {
   file.value = e.target.files[0]
@@ -51,6 +51,7 @@ const onFileChange = (e) => {
   downloadProgress.value = 0
   fileName.value = ''
   receiving.value = false
+  console.log('选择文件:', file.value.name)
 }
 
 const setupWebSocket = () => {
@@ -67,7 +68,7 @@ const setupWebSocket = () => {
   }
 
   ws.onclose = () => {
-    console.warn('[WebSocket] 已断开，尝试重连...')
+    console.warn('[WebSocket] 断开，尝试重连...')
     stopHeartbeat()
     clearReconnectTimer()
     reconnectTimer = setTimeout(() => {
@@ -77,7 +78,7 @@ const setupWebSocket = () => {
 
   ws.onerror = (err) => {
     console.error('[WebSocket] 错误:', err)
-    ws.close() // 错误后关闭，触发重连
+    ws.close()
   }
 
   ws.onmessage = async (event) => {
@@ -87,15 +88,19 @@ const setupWebSocket = () => {
       const msg = JSON.parse(event.data)
 
       if (msg.type === 'offer') {
+        console.log('[WebSocket] 收到offer')
         pc = createPeerConnection()
         pc.ondatachannel = (e) => receiveFile(e.channel)
         await pc.setRemoteDescription(new RTCSessionDescription(msg.offer))
         const answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
         ws.send(JSON.stringify({ type: 'answer', answer }))
+        console.log('[WebSocket] 发送answer')
       } else if (msg.type === 'answer') {
+        console.log('[WebSocket] 收到answer')
         await pc.setRemoteDescription(new RTCSessionDescription(msg.answer))
       } else if (msg.type === 'candidate') {
+        console.log('[WebSocket] 收到candidate')
         try {
           await pc.addIceCandidate(new RTCIceCandidate(msg.candidate))
         } catch (e) {
@@ -103,7 +108,7 @@ const setupWebSocket = () => {
         }
       }
     } catch (e) {
-      // 非 JSON 消息，比如心跳 pong，不处理
+      // 心跳ping/pong可能不是json，忽略
     }
   }
 }
@@ -120,8 +125,9 @@ const startHeartbeat = () => {
   heartbeatTimer = setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send('ping')
+      console.log('[WebSocket] 发送ping')
     }
-  }, 20000) // 20秒心跳
+  }, 20000)
 }
 
 const stopHeartbeat = () => {
@@ -139,8 +145,10 @@ const createPeerConnection = () => {
   newPc.onicecandidate = (event) => {
     if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }))
+      console.log('[WebRTC] 发送candidate')
     }
   }
+
   return newPc
 }
 
@@ -155,9 +163,11 @@ const waitForSocketOpen = (socket) => {
 }
 
 const startTransfer = async () => {
-  if (!file.value) return
+  if (!file.value) {
+    alert('请先选择文件')
+    return
+  }
 
-  // 先确保 WebSocket 连接
   if (!ws || ws.readyState >= WebSocket.CLOSING) {
     setupWebSocket()
     await waitForSocketOpen(ws)
@@ -166,39 +176,45 @@ const startTransfer = async () => {
   pc = createPeerConnection()
   dataChannels = []
 
-  // 创建多个 DataChannel 并行传输
+  let openCount = 0
+
   for (let i = 0; i < NUM_CHANNELS; i++) {
     const dc = pc.createDataChannel(`fileTransfer${i}`, {
       ordered: true,
       reliable: true
     })
     dc.binaryType = 'arraybuffer'
+
+    dc.onopen = () => {
+      openCount++
+      console.log(`DataChannel ${i} 打开`)
+      if (openCount === NUM_CHANNELS) {
+        console.log('所有DataChannel已打开，开始发送文件')
+        sendFileParallel(file.value)
+      }
+    }
+
+    dc.onclose = () => {
+      console.log(`DataChannel ${i} 关闭`)
+    }
+
     dataChannels.push(dc)
   }
 
   sending.value = true
   progress.value = 0
 
-  // DataChannels 状态检测，等待全部打开后发送文件
-  let openCount = 0
-  dataChannels.forEach(dc => {
-    dc.onopen = () => {
-      openCount++
-      if (openCount === NUM_CHANNELS) {
-        sendFileParallel(file.value)
-      }
-    }
-  })
-
   pc.onicecandidate = (event) => {
     if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }))
+      console.log('[WebRTC] 发送candidate')
     }
   }
 
   const offer = await pc.createOffer()
   await pc.setLocalDescription(offer)
   ws.send(JSON.stringify({ type: 'offer', offer }))
+  console.log('[WebRTC] 发送offer')
 }
 
 const sendFileParallel = (file) => {
@@ -209,7 +225,7 @@ const sendFileParallel = (file) => {
   let finishedChannels = 0
   let sentBytes = 0
 
-  // 发送文件信息，告诉接收端文件名、大小和通道数量
+  // 发送文件信息只通过第一个通道
   dataChannels[0].send(JSON.stringify({
     type: 'fileInfo',
     fileName: file.name,
@@ -223,11 +239,11 @@ const sendFileParallel = (file) => {
 
   function sendChunk(channelIndex) {
     if (offsets[channelIndex] >= totalSize) {
-      // 发送结束信号
       dataChannels[channelIndex].send(JSON.stringify({ type: 'done', channelIndex }))
       finishedChannels++
       if (finishedChannels === numChannels) {
         sending.value = false
+        console.log('所有通道发送完毕')
       }
       return
     }
@@ -240,7 +256,6 @@ const sendFileParallel = (file) => {
       dataChannels[channelIndex].send(e.target.result)
       offsets[channelIndex] += chunkSize
       sentBytes += e.target.result.byteLength
-
       progress.value = ((sentBytes / totalSize) * 100).toFixed(2)
 
       const dc = dataChannels[channelIndex]
@@ -287,14 +302,13 @@ const receiveFile = (channel) => {
           fileName.value = msg.fileName
           receiving.value = true
           downloadProgress.value = 0
+          console.log('收到文件信息:', msg)
         } else if (msg.type === 'done') {
-          receivedBytesMap[idx] = -1 // 标记完成
+          receivedBytesMap[idx] = -1
 
-          // 判断所有通道是否都完成
           if (Object.values(receivedBytesMap).length === window._numChannels &&
               Object.values(receivedBytesMap).every(val => val === -1)) {
 
-            // 拼接所有 buffer，顺序按通道号拼接
             let buffers = []
             for (let i = 0; i < window._numChannels; i++) {
               buffers = buffers.concat(receivedBuffersMap[i])
@@ -304,6 +318,7 @@ const receiveFile = (channel) => {
             const url = URL.createObjectURL(blob)
             downloadUrl.value = url
             receiving.value = false
+            console.log('文件接收完成')
           }
         }
       } catch (e) {
@@ -313,7 +328,6 @@ const receiveFile = (channel) => {
       receivedBuffersMap[idx].push(event.data)
       receivedBytesMap[idx] += event.data.byteLength
 
-      // 计算总接收进度
       const totalReceived = Object.values(receivedBytesMap).reduce((acc, val) => val === -1 ? acc : acc + val, 0)
       if (window._expectedSize > 0) {
         downloadProgress.value = ((totalReceived / window._expectedSize) * 100).toFixed(2)
