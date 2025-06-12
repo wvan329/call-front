@@ -1,311 +1,348 @@
 <template>
   <div id="app">
-    <h1>高速 P2P 大文件传输123</h1>
+    <h1>大文件并行传输加速示例</h1>
 
-    <div v-if="!isReceiver">
-      <input type="file" @change="onFileChange" />
-      <button @click="startTransfer" :disabled="!file || sending">开始传输</button>
-      <div v-if="file">
-        <p>文件名: {{ file.name }}</p>
-        <p>发送进度: {{ progress }}%</p>
-        <progress :value="progress" max="100"></progress>
-      </div>
+    <input type="file" @change="onFileChange" />
+    <button @click="startTransfer" :disabled="!file || sending">开始传输</button>
+
+    <div v-if="file">
+      <p>文件名: {{ file.name }}</p>
+      <p>发送进度: {{ progress }}%</p>
+      <progress :value="progress" max="100"></progress>
     </div>
 
-    <div v-else>
-      <p>接收文件名: {{ fileName || '等待文件...' }}</p>
+    <div v-if="receiving || downloadUrl">
+      <p>接收文件: <span>{{ fileName }}</span></p>
       <p>接收进度: {{ downloadProgress }}%</p>
       <progress :value="downloadProgress" max="100"></progress>
-      <button v-if="downloadReady" @click="downloadFile">下载文件</button>
+
+      <div v-if="downloadUrl">
+        <p><a :href="downloadUrl" :download="fileName">点击下载 {{ fileName }}</a></p>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onBeforeUnmount } from 'vue'
 
 const file = ref(null)
 const progress = ref(0)
-const downloadProgress = ref(0)
-const sending = ref(false)
-const isReceiver = ref(false) // 用来区分接收端还是发送端，手动修改或者用URL参数
+const downloadUrl = ref('')
 const fileName = ref('')
-const downloadReady = ref(false)
-
-const SLICE_SIZE = 512 * 1024 // 512KB切片
-const CHANNEL_COUNT = 4
+const downloadProgress = ref(0)
+const receiving = ref(false)
+const sending = ref(false)
 
 let ws = null
 let pc = null
 let dataChannels = []
-let receivedBuffers = []
-let totalSlices = 0
-let sliceSize = 0
-let receivedCount = 0
+let heartbeatTimer = null
+let reconnectTimer = null
 
-// 发送端 - 选文件
-function onFileChange(e) {
+const NUM_CHANNELS = 4 // 并行通道数量
+const CHUNK_SIZE = 64 * 1024 // 64KB 分片大小
+
+const onFileChange = (e) => {
   file.value = e.target.files[0]
   progress.value = 0
+  sending.value = false
+  downloadUrl.value = ''
+  downloadProgress.value = 0
+  fileName.value = ''
+  receiving.value = false
 }
 
-// WebSocket 连接及信令管理
-function setupWebSocket() {
-  return new Promise((resolve) => {
-    if (ws) {
-      ws.close()
-      ws = null
-    }
-    ws = new WebSocket('ws://59.110.35.198/wgk/ws/file')
+const setupWebSocket = () => {
+  if (ws) {
+    ws.close()
+  }
+  clearReconnectTimer()
 
-    ws.onopen = () => {
-      console.log('[WebSocket] 连接成功')
-      startHeartbeat()
-      resolve()
-    }
+  ws = new WebSocket('ws://59.110.35.198/wgk/ws/file')
 
-    ws.onmessage = async (event) => {
-      if (event.data === 'pong') return
+  ws.onopen = () => {
+    console.log('[WebSocket] 已连接')
+    startHeartbeat()
+  }
+
+  ws.onclose = () => {
+    console.warn('[WebSocket] 已断开，尝试重连...')
+    stopHeartbeat()
+    clearReconnectTimer()
+    reconnectTimer = setTimeout(() => {
+      setupWebSocket()
+    }, 3000)
+  }
+
+  ws.onerror = (err) => {
+    console.error('[WebSocket] 错误:', err)
+    ws.close() // 错误后关闭，触发重连
+  }
+
+  ws.onmessage = async (event) => {
+    if (!pc) return
+
+    try {
       const msg = JSON.parse(event.data)
+
       if (msg.type === 'offer') {
-        // 接收端接收offer
-        if (!pc) createPeerConnection()
+        pc = createPeerConnection()
+        pc.ondatachannel = (e) => receiveFile(e.channel)
         await pc.setRemoteDescription(new RTCSessionDescription(msg.offer))
         const answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
         ws.send(JSON.stringify({ type: 'answer', answer }))
       } else if (msg.type === 'answer') {
-        // 发送端接收answer
         await pc.setRemoteDescription(new RTCSessionDescription(msg.answer))
       } else if (msg.type === 'candidate') {
         try {
           await pc.addIceCandidate(new RTCIceCandidate(msg.candidate))
         } catch (e) {
-          console.warn('添加 ICE Candidate 失败:', e)
+          console.error('ICE candidate error:', e)
         }
-      } else if (msg.type === 'fileMeta') {
-        // 接收端收到文件元信息，准备接收
-        isReceiver.value = true
-        fileName.value = msg.name
-        sliceSize = msg.sliceSize
-        totalSlices = msg.totalSlices
-        receivedCount = 0
-        receivedBuffers = new Array(totalSlices)
-        downloadProgress.value = 0
-        downloadReady.value = false
       }
+    } catch (e) {
+      // 非 JSON 消息，比如心跳 pong，不处理
     }
-
-    ws.onclose = () => {
-      console.warn('[WebSocket] 断开，3秒后重连')
-      stopHeartbeat()
-      setTimeout(() => setupWebSocket(), 3000)
-    }
-
-    ws.onerror = (err) => {
-      console.error('[WebSocket] 错误:', err)
-      ws.close()
-    }
-  })
+  }
 }
 
-let heartbeatTimer = null
-function startHeartbeat() {
-  if (heartbeatTimer) clearInterval(heartbeatTimer)
+const clearReconnectTimer = () => {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+}
+
+const startHeartbeat = () => {
+  stopHeartbeat()
   heartbeatTimer = setInterval(() => {
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send('ping')
-  }, 20000)
-}
-function stopHeartbeat() {
-  if (heartbeatTimer) clearInterval(heartbeatTimer)
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send('ping')
+    }
+  }, 20000) // 20秒心跳
 }
 
-// 创建RTCPeerConnection和DataChannels
-function createPeerConnection() {
-  pc = new RTCPeerConnection({
+const stopHeartbeat = () => {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer)
+    heartbeatTimer = null
+  }
+}
+
+const createPeerConnection = () => {
+  const newPc = new RTCPeerConnection({
     iceServers: [{ urls: 'stun:59.110.35.198:3478' }]
   })
 
-  pc.onicecandidate = (e) => {
-    if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }))
-  }
-
-  if (isReceiver.value) {
-    // 接收端监听datachannel
-    pc.ondatachannel = (e) => {
-      const channel = e.channel
-      channel.binaryType = 'arraybuffer'
-      console.log('[DataChannel] 新通道', channel.label)
-      setupReceiveChannel(channel)
-    }
-  } else {
-    // 发送端创建多个DataChannel
-    dataChannels = []
-    for (let i = 0; i < CHANNEL_COUNT; i++) {
-      const channel = pc.createDataChannel(`ch-${i}`, { ordered: true, reliable: true })
-      channel.binaryType = 'arraybuffer'
-      dataChannels.push(channel)
+  newPc.onicecandidate = (event) => {
+    if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }))
     }
   }
+  return newPc
 }
 
-// 发送端开始传输
-async function startTransfer() {
-  if (!file.value) return alert('请先选择文件')
-  sending.value = true
-  await setupWebSocket()
-  createPeerConnection()
+const waitForSocketOpen = (socket) => {
+  return new Promise((resolve, reject) => {
+    if (socket.readyState === WebSocket.OPEN) resolve()
+    else {
+      socket.onopen = () => resolve()
+      socket.onerror = (e) => reject(e)
+    }
+  })
+}
 
-  // 创建offer并发送
+const startTransfer = async () => {
+  if (!file.value) return
+
+  // 先确保 WebSocket 连接
+  if (!ws || ws.readyState >= WebSocket.CLOSING) {
+    setupWebSocket()
+    await waitForSocketOpen(ws)
+  }
+
+  pc = createPeerConnection()
+  dataChannels = []
+
+  // 创建多个 DataChannel 并行传输
+  for (let i = 0; i < NUM_CHANNELS; i++) {
+    const dc = pc.createDataChannel(`fileTransfer${i}`, {
+      ordered: true,
+      reliable: true
+    })
+    dc.binaryType = 'arraybuffer'
+    dataChannels.push(dc)
+  }
+
+  sending.value = true
+  progress.value = 0
+
+  // DataChannels 状态检测，等待全部打开后发送文件
+  let openCount = 0
+  dataChannels.forEach(dc => {
+    dc.onopen = () => {
+      openCount++
+      if (openCount === NUM_CHANNELS) {
+        sendFileParallel(file.value)
+      }
+    }
+  })
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }))
+    }
+  }
+
   const offer = await pc.createOffer()
   await pc.setLocalDescription(offer)
   ws.send(JSON.stringify({ type: 'offer', offer }))
-
-  // 等待所有DataChannel打开
-  await waitAllChannelsOpen(dataChannels)
-
-  console.log('🟢 所有DataChannel已打开，开始并行传输文件')
-  sendFileParallel()
 }
 
-function waitAllChannelsOpen(channels) {
-  return Promise.all(
-    channels.map(
-      (ch) =>
-        new Promise((resolve) => {
-          if (ch.readyState === 'open') resolve()
-          else ch.onopen = () => resolve()
-          ch.onerror = (e) => console.error('[DataChannel] 错误', e)
-        })
-    )
-  )
+const sendFileParallel = (file) => {
+  const totalSize = file.size
+  const chunkSize = CHUNK_SIZE
+  const numChannels = dataChannels.length
+  let offsets = new Array(numChannels).fill(0)
+  let finishedChannels = 0
+  let sentBytes = 0
+
+  // 发送文件信息，告诉接收端文件名、大小和通道数量
+  dataChannels[0].send(JSON.stringify({
+    type: 'fileInfo',
+    fileName: file.name,
+    fileSize: totalSize,
+    numChannels,
+  }))
+
+  for (let i = 0; i < numChannels; i++) {
+    sendChunk(i)
+  }
+
+  function sendChunk(channelIndex) {
+    if (offsets[channelIndex] >= totalSize) {
+      // 发送结束信号
+      dataChannels[channelIndex].send(JSON.stringify({ type: 'done', channelIndex }))
+      finishedChannels++
+      if (finishedChannels === numChannels) {
+        sending.value = false
+      }
+      return
+    }
+
+    const start = offsets[channelIndex]
+    const slice = file.slice(start, start + chunkSize)
+    const reader = new FileReader()
+
+    reader.onload = (e) => {
+      dataChannels[channelIndex].send(e.target.result)
+      offsets[channelIndex] += chunkSize
+      sentBytes += e.target.result.byteLength
+
+      progress.value = ((sentBytes / totalSize) * 100).toFixed(2)
+
+      const dc = dataChannels[channelIndex]
+      if (dc.bufferedAmount > dc.bufferedAmountLowThreshold) {
+        dc.onbufferedamountlow = () => {
+          sendChunk(channelIndex)
+          dc.onbufferedamountlow = null
+        }
+      } else {
+        sendChunk(channelIndex)
+      }
+    }
+
+    reader.readAsArrayBuffer(slice)
+  }
 }
 
-// 并行分片发送
-async function sendFileParallel() {
-  const f = file.value
-  const total = Math.ceil(f.size / SLICE_SIZE)
+const receiveFile = (channel) => {
+  const idx = parseInt(channel.label.replace('fileTransfer', ''))
+  if (isNaN(idx)) return
 
-  ws.send(
-    JSON.stringify({
-      type: 'fileMeta',
-      name: f.name,
-      size: f.size,
-      sliceSize: SLICE_SIZE,
-      totalSlices: total,
-      channelCount: dataChannels.length
-    })
-  )
+  if (!window._receivedBuffersMap) {
+    window._receivedBuffersMap = {}
+    window._receivedBytesMap = {}
+    window._expectedSize = 0
+    window._fileName = ''
+    window._numChannels = 0
+  }
 
-  let sent = 0
+  const receivedBuffersMap = window._receivedBuffersMap
+  const receivedBytesMap = window._receivedBytesMap
 
-  for (let i = 0; i < total; i++) {
-    const start = i * SLICE_SIZE
-    const end = Math.min(f.size, start + SLICE_SIZE)
-    const blob = f.slice(start, end)
-    const buffer = await blob.arrayBuffer()
+  receivedBuffersMap[idx] = []
+  receivedBytesMap[idx] = 0
 
-    // 4字节序号头 + 数据体
-    const header = new Uint32Array([i])
-    const payload = new Uint8Array(header.byteLength + buffer.byteLength)
-    payload.set(new Uint8Array(header.buffer), 0)
-    payload.set(new Uint8Array(buffer), header.byteLength)
+  channel.onmessage = (event) => {
+    if (typeof event.data === 'string') {
+      try {
+        const msg = JSON.parse(event.data)
+        if (msg.type === 'fileInfo') {
+          window._expectedSize = msg.fileSize
+          window._fileName = msg.fileName
+          window._numChannels = msg.numChannels
+          fileName.value = msg.fileName
+          receiving.value = true
+          downloadProgress.value = 0
+        } else if (msg.type === 'done') {
+          receivedBytesMap[idx] = -1 // 标记完成
 
-    // 轮询选通道发
-    const ch = dataChannels[i % dataChannels.length]
+          // 判断所有通道是否都完成
+          if (Object.values(receivedBytesMap).length === window._numChannels &&
+              Object.values(receivedBytesMap).every(val => val === -1)) {
 
-    if (ch.readyState === 'open') {
-      ch.send(payload)
+            // 拼接所有 buffer，顺序按通道号拼接
+            let buffers = []
+            for (let i = 0; i < window._numChannels; i++) {
+              buffers = buffers.concat(receivedBuffersMap[i])
+            }
+
+            const blob = new Blob(buffers)
+            const url = URL.createObjectURL(blob)
+            downloadUrl.value = url
+            receiving.value = false
+          }
+        }
+      } catch (e) {
+        console.error('接收消息解析错误', e)
+      }
     } else {
-      console.warn(`[WARN] 通道 ${ch.label} 不是open，跳过片段 ${i}`)
-    }
+      receivedBuffersMap[idx].push(event.data)
+      receivedBytesMap[idx] += event.data.byteLength
 
-    sent++
-    progress.value = ((sent / total) * 100).toFixed(2)
-    await sleep(1) // 给事件循环喘息，防止堵塞（可根据网络调整）
-  }
-
-  sending.value = false
-  console.log('✅ 文件发送完毕')
-}
-
-// 接收端处理单个DataChannel
-function setupReceiveChannel(channel) {
-  channel.onmessage = async (event) => {
-    const buf = event.data
-    const view = new DataView(buf)
-    const idx = view.getUint32(0, false)
-    const data = buf.slice(4)
-
-    if (!receivedBuffers[idx]) {
-      receivedBuffers[idx] = data
-      receivedCount++
-      downloadProgress.value = ((receivedCount / totalSlices) * 100).toFixed(2)
-    }
-
-    if (receivedCount === totalSlices) {
-      console.log('✅ 文件接收完成')
-      downloadReady.value = true
-      // 合并文件buffer
-      createDownloadBlob()
+      // 计算总接收进度
+      const totalReceived = Object.values(receivedBytesMap).reduce((acc, val) => val === -1 ? acc : acc + val, 0)
+      if (window._expectedSize > 0) {
+        downloadProgress.value = ((totalReceived / window._expectedSize) * 100).toFixed(2)
+      }
     }
   }
-}
-
-let downloadBlob = null
-function createDownloadBlob() {
-  // 拼接ArrayBuffer数组
-  const buffers = receivedBuffers.filter(Boolean)
-  if (buffers.length !== totalSlices) {
-    console.error('接收片段不完整')
-    return
-  }
-  downloadBlob = new Blob(buffers)
-}
-
-// 下载按钮触发
-function downloadFile() {
-  if (!downloadBlob) return alert('文件还没准备好')
-  const url = URL.createObjectURL(downloadBlob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = fileName.value
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
-  URL.revokeObjectURL(url)
-}
-
-// 工具
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms))
 }
 
 onMounted(() => {
-  // 这里可根据需求设置角色，比如URL带 ?receiver=true
-  const urlParams = new URLSearchParams(window.location.search)
-  if (urlParams.get('receiver') === 'true') {
-    isReceiver.value = true
-    setupWebSocket().then(() => {
-      createPeerConnection()
-    })
-  }
+  setupWebSocket()
+})
+
+onBeforeUnmount(() => {
+  stopHeartbeat()
+  clearReconnectTimer()
+  if (ws) ws.close()
+  if (pc) pc.close()
 })
 </script>
 
 <style>
 #app {
   max-width: 600px;
-  margin: 20px auto;
-  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  margin: 2rem auto;
+  font-family: Arial, sans-serif;
 }
+
 progress {
   width: 100%;
   height: 20px;
-}
-button {
-  margin-top: 10px;
-  padding: 6px 12px;
-  font-size: 16px;
 }
 </style>
