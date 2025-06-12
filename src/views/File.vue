@@ -38,7 +38,7 @@
           </div>
           <div class="file-progress">
             <div class="progress-bar" :style="{ width: file.progress + '%' }"></div>
-            <span class="progress-text">{{ file.progress.toFixed(1) }}%</span>
+            <span class="progress-text">{{ file.progress.toFixed(2) }}%</span>
           </div>
           <p v-if="file.error" class="file-error">{{ file.error }}</p>
         </div>
@@ -49,31 +49,36 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted, watchEffect } from 'vue';
+import { ref, reactive, computed, onMounted, onUnmounted, watchEffect, nextTick } from 'vue';
 import { sha256 } from 'js-sha256';
 
 // --- 配置常量 ---
 const WS_URL = 'ws://59.110.35.198/wgk/ws/file';
 const ICE_SERVERS = [{ urls: 'stun:59.110.35.198:3478' }];
 
-// 传输参数
-const INITIAL_CHUNK_SIZE = 64 * 1024;  // 初始块大小 64KB
-const MIN_CHUNK_SIZE = 8 * 1024;       // 最小块大小 8KB
-const MAX_CHUNK_SIZE = 512 * 1024;     // 最大块大小 512KB
-const INITIAL_BUFFER_LIMIT = 8 * 1024 * 1024; // 初始缓冲区限制 8MB
-const MIN_BUFFER_LIMIT = 2 * 1024 * 1024;     // 最小缓冲区限制 2MB
-const MAX_BUFFER_LIMIT = 64 * 1024 * 1024;    // 最大缓冲区限制 64MB
+// 传输参数 - 降低初始值以适应大文件传输
+const INITIAL_CHUNK_SIZE = 32 * 1024;  // 初始块大小 32KB
+const MIN_CHUNK_SIZE = 4 * 1024;       // 最小块大小 4KB
+const MAX_CHUNK_SIZE = 256 * 1024;     // 最大块大小 256KB
+const INITIAL_BUFFER_LIMIT = 4 * 1024 * 1024; // 初始缓冲区限制 4MB
+const MIN_BUFFER_LIMIT = 1 * 1024 * 1024;     // 最小缓冲区限制 1MB
+const MAX_BUFFER_LIMIT = 32 * 1024 * 1024;    // 最大缓冲区限制 32MB
 
 // 超时设置
 const ACK_TIMEOUT = 5000;              // ACK超时时间(毫秒)
-const MAX_RETRIES = 10;                // 最大重试次数
+const MAX_RETRIES = 15;                // 增加最大重试次数到15
 const HEARTBEAT_INTERVAL = 25000;      // WebSocket心跳间隔
 const CONNECTION_TIMEOUT = 30000;      // 连接超时时间
 
 // 自适应控制
-const ADAPTIVE_INTERVAL = 1000;        // 自适应参数调整间隔(毫秒)
-const CONGESTION_THRESHOLD = 0.7;      // 拥塞阈值
-const UI_UPDATE_INTERVAL = 200;        // UI更新间隔(毫秒)
+const ADAPTIVE_INTERVAL = 500;         // 加快自适应参数调整间隔(毫秒)
+const CONGESTION_THRESHOLD = 0.5;      // 降低拥塞阈值
+const UI_UPDATE_INTERVAL = 100;        // 加快UI更新间隔(毫秒)
+
+// 大文件处理参数
+const LARGE_FILE_THRESHOLD = 50 * 1024 * 1024; // 50MB定义为大文件
+const LARGE_FILE_CHUNK_SIZE = 16 * 1024;       // 大文件使用更小的块大小
+const LARGE_FILE_BUFFER_LIMIT = 2 * 1024 * 1024; // 大文件使用更小的缓冲区限制
 
 // --- 状态管理 ---
 const ws = ref(null);
@@ -96,12 +101,14 @@ const lastSpeedCalcTime = ref(0);
 const lastBytesSentForSpeed = ref(0);
 const currentSendSpeed = ref(0);
 const sendProgress = ref(0);
+const estimatedProgress = ref(0); // 估算进度（不依赖ACK）
 
 // 自适应传输参数
 const currentChunkSize = ref(INITIAL_CHUNK_SIZE);
 const currentBufferLimit = ref(INITIAL_BUFFER_LIMIT);
 const congestionRate = ref(0);
 const recentBufferFullEvents = ref(0);
+const isLargeFile = ref(false);
 
 // --- 工具函数 ---
 const formatBytes = (bytes, decimals = 2) => {
@@ -160,13 +167,15 @@ const handleFileSelection = (event) => {
   selectedFile.value = event.target.files[0];
   errorMessage.value = '';
   sendProgress.value = 0;
+  estimatedProgress.value = 0;
   totalBytesSent.value = 0;
   currentSendSpeed.value = 0;
   isTransferring.value = false;
   
   // 重置自适应参数
-  currentChunkSize.value = INITIAL_CHUNK_SIZE;
-  currentBufferLimit.value = INITIAL_BUFFER_LIMIT;
+  isLargeFile.value = selectedFile.value && selectedFile.value.size > LARGE_FILE_THRESHOLD;
+  currentChunkSize.value = isLargeFile.value ? LARGE_FILE_CHUNK_SIZE : INITIAL_CHUNK_SIZE;
+  currentBufferLimit.value = isLargeFile.value ? LARGE_FILE_BUFFER_LIMIT : INITIAL_BUFFER_LIMIT;
   congestionRate.value = 0;
   recentBufferFullEvents.value = 0;
   
@@ -203,6 +212,7 @@ const startFileTransfer = async () => {
   lastBytesSentForSpeed.value = 0;
   currentSendSpeed.value = 0;
   sendProgress.value = 0;
+  estimatedProgress.value = 0;
 
   const file = selectedFile.value;
   const fileId = generateUniqueId();
@@ -237,6 +247,9 @@ const startFileTransfer = async () => {
     lastBufferCheckTime: Date.now(),
     bufferFullEvents: 0,
     speedHistory: [], // 存储最近的速度数据
+    lastProgressUpdate: 0, // 上次更新进度的时间
+    estimatedProgress: 0, // 估算进度
+    isLargeFile: isLargeFile.value
   };
 
   outgoingTransfers[fileId] = currentTransfer;
@@ -257,7 +270,12 @@ const startFileTransfer = async () => {
       bufferStatus: {
         checks: 0,
         full: 0
-      }
+      },
+      lastRetryTime: 0, // 上次重试的时间
+      retryBackoff: 100, // 重试退避时间(毫秒)
+      maxRetryBackoff: 2000, // 最大重试退避时间
+      reconnectionAttempts: 0, // 重连尝试次数
+      lastConnectionAttempt: 0 // 上次重连尝试时间
     };
     currentTransfer.peers[peerId] = peerTransfer;
 
@@ -274,6 +292,7 @@ const startFileTransfer = async () => {
     console.log('文件传输成功完成!');
     errorMessage.value = '';
     sendProgress.value = 100;
+    estimatedProgress.value = 100;
   } catch (error) {
     console.error('文件传输失败:', error);
     errorMessage.value = `文件传输失败: ${error.message}`;
@@ -323,10 +342,21 @@ const processOutgoingQueue = async (fileId, peerId) => {
     transfer.bufferFullEvents = 0;
   }
   
-  if (dc.bufferedAmount > currentBufferLimit.value) {
+  // 更严格的缓冲区检查 - 只在缓冲区使用低于70%时发送
+  const bufferUsage = dc.bufferedAmount / currentBufferLimit.value;
+  if (bufferUsage > 0.7) {
     transfer.bufferFullEvents++;
     recentBufferFullEvents.value++;
-    return;
+    
+    // 对于大文件，更保守地处理缓冲区
+    if (transfer.isLargeFile && bufferUsage > 0.8) {
+      // 使用指数退避策略，等待后再重试
+      setTimeout(() => {
+        peerTransfer.sendInProgress = false;
+        processOutgoingQueue(fileId, peerId);
+      }, 50 + Math.random() * 100); // 随机延迟以避免同步重试
+      return;
+    }
   }
 
   peerTransfer.sendInProgress = true;
@@ -376,6 +406,14 @@ const processOutgoingQueue = async (fileId, peerId) => {
           transfer.bytesSent += slice.size;
           totalBytesSent.value += slice.size;
           transfer.chunksProcessed++;
+          
+          // 更新估算进度（不依赖ACK）
+          const now = Date.now();
+          if (now - transfer.lastProgressUpdate > UI_UPDATE_INTERVAL) {
+            transfer.lastProgressUpdate = now;
+            transfer.estimatedProgress = Math.min((transfer.chunksProcessed / transfer.totalChunks) * 100, 100);
+            estimatedProgress.value = transfer.estimatedProgress;
+          }
 
           // 继续处理队列
           setTimeout(() => {
@@ -386,11 +424,24 @@ const processOutgoingQueue = async (fileId, peerId) => {
         } catch (sendError) {
           console.error(`向 ${peerId} 发送块 ${nextChunkIndex} 时出错:`, sendError);
           peerTransfer.consecutiveFailures++;
-          if (peerTransfer.consecutiveFailures > 5) {
-            console.warn(`对等端 ${peerId} 失败次数过多，关闭连接`);
-            closePeerConnection(peerId);
+          
+          // 更智能的失败处理
+          if (peerTransfer.consecutiveFailures > 3) {
+            // 退避重试，避免立即重连
+            peerTransfer.retryBackoff = Math.min(
+              peerTransfer.retryBackoff * 2,
+              peerTransfer.maxRetryBackoff
+            );
+            
+            setTimeout(() => {
+              peerTransfer.sendInProgress = false;
+              peerTransfer.consecutiveFailures = 0;
+              processOutgoingQueue(fileId, peerId);
+            }, peerTransfer.retryBackoff);
+          } else {
+            peerTransfer.sendInProgress = false;
+            processOutgoingQueue(fileId, peerId);
           }
-          peerTransfer.sendInProgress = false;
         }
       };
 
@@ -440,7 +491,8 @@ const sendMetaData = (dc, fileId, name, size, type, hash) => {
     fileType: type,
     chunkSize: currentChunkSize.value,
     hash: hash,
-    totalChunks: Math.ceil(size / currentChunkSize.value)
+    totalChunks: Math.ceil(size / currentChunkSize.value),
+    isLargeFile: isLargeFile.value
   };
   try {
     dc.send(JSON.stringify(metadata));
@@ -491,6 +543,7 @@ const handleChunkAck = (fileId, chunkIndex, peerId) => {
     if (peerTransfer) {
       peerTransfer.lastAckTime = Date.now();
       peerTransfer.consecutiveFailures = 0;
+      peerTransfer.retryBackoff = 100; // 重置重试退避
     }
     
     transfer.ackedChunks.add(chunkIndex);
@@ -538,7 +591,13 @@ const updateSendProgress = () => {
       const totalChunks = currentFileTransfer.totalChunks;
 
       if (totalChunks > 0) {
-        sendProgress.value = Math.min((completedChunks / totalChunks) * 100, 100);
+        // 优先使用确认的进度，但在ACK不足时使用估算进度
+        if (completedChunks > 0) {
+          sendProgress.value = Math.min((completedChunks / totalChunks) * 100, 100);
+        } else {
+          // 当没有确认的块时，使用估算进度（基于已发送的块）
+          sendProgress.value = currentFileTransfer.estimatedProgress;
+        }
       }
     }
   }
@@ -558,21 +617,21 @@ const adjustTransferParameters = () => {
     // 高拥塞 - 减少块大小和缓冲区限制
     currentChunkSize.value = Math.max(
       MIN_CHUNK_SIZE,
-      Math.floor(currentChunkSize.value * 0.8)
+      Math.floor(currentChunkSize.value * 0.7)
     );
     currentBufferLimit.value = Math.max(
       MIN_BUFFER_LIMIT,
-      Math.floor(currentBufferLimit.value * 0.9)
+      Math.floor(currentBufferLimit.value * 0.8)
     );
   } else if (congestionRate.value < 0.2) {
     // 低拥塞 - 增加块大小和缓冲区限制
     currentChunkSize.value = Math.min(
       MAX_CHUNK_SIZE,
-      Math.floor(currentChunkSize.value * 1.2)
+      Math.floor(currentChunkSize.value * 1.1)
     );
     currentBufferLimit.value = Math.min(
       MAX_BUFFER_LIMIT,
-      Math.floor(currentBufferLimit.value * 1.1)
+      Math.floor(currentBufferLimit.value * 1.05)
     );
   }
   
@@ -606,8 +665,8 @@ const checkAndRetransmit = () => {
             const dc = peer.dataChannel;
             if (dc?.readyState === 'open' && !transfer.peers[peerId].isPeerComplete) {
               try {
-                // 检查缓冲区状态
-                if (dc.bufferedAmount < currentBufferLimit.value * 0.8) {
+                // 更严格的缓冲区检查 - 只在缓冲区使用低于50%时重传
+                if (dc.bufferedAmount < currentBufferLimit.value * 0.5) {
                   dc.send(pendingAck.data);
                   pendingAck.timestamp = now;
                   pendingAck.retries++;
@@ -857,10 +916,16 @@ const closePeerConnection = (peerId) => {
 
       // 检查是否所有对等端都断开
       if (Object.keys(transfer.peers).length === 0 && !transfer.isComplete) {
+        // 尝试恢复传输
         if (transfer.reject) {
-          transfer.reject(new Error('传输过程中所有对等端断开连接'));
+          // 延迟拒绝，给重连一些时间
+          setTimeout(() => {
+            if (!transfer.isComplete && Object.keys(transfer.peers).length === 0) {
+              transfer.reject(new Error('传输过程中所有对等端断开连接'));
+              delete outgoingTransfers[fileId];
+            }
+          }, 10000); // 10秒后检查
         }
-        delete outgoingTransfers[fileId];
       }
     }
   }
@@ -877,6 +942,33 @@ const setupDataChannel = (dc, peerId) => {
     peer.status = 'connected';
     peer.lastActivity = Date.now();
     console.log(`与 ${peerId} 的数据通道已打开`);
+    
+    // 恢复进行中的传输
+    Object.keys(outgoingTransfers).forEach(fileId => {
+      const transfer = outgoingTransfers[fileId];
+      if (!transfer.isComplete && !transfer.peers[peerId]) {
+        const peerTransfer = {
+          readQueue: [],
+          isPeerComplete: false,
+          lastAckTime: Date.now(),
+          sendInProgress: false,
+          consecutiveFailures: 0,
+          bufferStatus: {
+            checks: 0,
+            full: 0
+          },
+          lastRetryTime: 0,
+          retryBackoff: 100,
+          maxRetryBackoff: 2000
+        };
+        transfer.peers[peerId] = peerTransfer;
+        
+        // 发送元数据
+        sendMetaData(dc, fileId, transfer.file.name, transfer.file.size, 
+                    transfer.file.type || 'application/octet-stream', transfer.fileHash);
+        processOutgoingQueue(fileId, peerId);
+      }
+    });
   };
   
   dc.onclose = () => {
@@ -898,6 +990,25 @@ const setupDataChannel = (dc, peerId) => {
   dc.onerror = (error) => {
     console.error(`与 ${peerId} 的数据通道错误:`, error);
     closePeerConnection(peerId);
+    
+    // 尝试重新连接
+    if (isTransferring.value) {
+      const now = Date.now();
+      const peerTransfer = Object.values(outgoingTransfers)
+        .find(t => !t.isComplete)?.peers[peerId];
+      
+      if (!peerTransfer || now - (peerTransfer.lastConnectionAttempt || 0) > 10000) {
+        console.log(`数据通道错误后尝试重新连接到 ${peerId}...`);
+        setTimeout(() => {
+          createPeerConnection(peerId);
+          createOffer(peerId);
+          if (peerTransfer) {
+            peerTransfer.lastConnectionAttempt = now;
+            peerTransfer.reconnectionAttempts = (peerTransfer.reconnectionAttempts || 0) + 1;
+          }
+        }, 5000);
+      }
+    }
   };
   
   dc.onmessage = (event) => {
@@ -955,7 +1066,8 @@ const handleFileMetadata = (metadata, peerId) => {
     peerId: peerId,
     startTime: Date.now(),
     completed: false,
-    fileData: null
+    fileData: null,
+    isLargeFile: metadata.isLargeFile
   };
 
   // 添加到接收文件列表
@@ -1019,11 +1131,14 @@ const handleFileChunk = (data, peerId) => {
     // 发送ACK
     const dc = peerConnections[peerId]?.dataChannel;
     if (dc?.readyState === 'open') {
-      dc.send(JSON.stringify({
-        type: 'chunk-ack',
-        fileId: fileId,
-        chunkIndex: chunkIndex
-      }));
+      // 对大文件增加ACK发送频率
+      if (fileInfo.isLargeFile || Math.random() < 0.8) {
+        dc.send(JSON.stringify({
+          type: 'chunk-ack',
+          fileId: fileId,
+          chunkIndex: chunkIndex
+        }));
+      }
     }
     
     // 检查是否完成
