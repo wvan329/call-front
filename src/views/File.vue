@@ -42,7 +42,11 @@ const onFileChange = (e) => {
 }
 
 const startTransfer = async () => {
-  setupWebSocket()
+  if (!ws || ws.readyState >= WebSocket.CLOSING) {
+    ws = new WebSocket('ws://59.110.35.198/wgk/ws/file')
+    setupWebSocket()
+    await waitForSocketOpen(ws)
+  }
 
   pc = new RTCPeerConnection({
     iceServers: [{ urls: 'stun:59.110.35.198:3478' }]
@@ -71,6 +75,16 @@ const startTransfer = async () => {
   ws.send(JSON.stringify({ type: 'offer', offer }))
 }
 
+const waitForSocketOpen = (socket) => {
+  return new Promise((resolve, reject) => {
+    if (socket.readyState === WebSocket.OPEN) {
+      resolve()
+    } else {
+      socket.onopen = () => resolve()
+      socket.onerror = (err) => reject(err)
+    }
+  })
+}
 function setupWebSocket() {
   ws = new WebSocket('ws://59.110.35.198/wgk/ws/file')
 
@@ -207,6 +221,7 @@ onMounted(() => {
   margin: 2rem auto;
   font-family: Arial, sans-serif;
 }
+
 progress {
   width: 100%;
   height: 20px;
