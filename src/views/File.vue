@@ -90,12 +90,40 @@ const waitForSocketOpen = (socket) => {
   })
 }
 
+let heartbeatTimer = null
+let reconnectTimer = null
+
 function setupWebSocket() {
+  if (ws) {
+    ws.close()
+  }
+
   ws = new WebSocket('ws://59.110.35.198/wgk/ws/file')
+
+  ws.onopen = () => {
+    console.log('[WebSocket] 已连接')
+    startHeartbeat()
+  }
+
+  ws.onclose = () => {
+    console.warn('[WebSocket] 已断开，尝试重连...')
+    stopHeartbeat()
+    reconnectTimer = setTimeout(() => {
+      setupWebSocket()
+    }, 3000)
+  }
+
+  ws.onerror = (err) => {
+    console.error('[WebSocket] 错误:', err)
+    ws.close() // 错误后关闭，触发重连
+  }
 
   ws.onmessage = async (event) => {
     const msg = JSON.parse(event.data)
 
+    if (msg.type === 'pong') return // 心跳响应
+
+    // 原处理逻辑：
     if (msg.type === 'offer') {
       pc = new RTCPeerConnection({
         iceServers: [{ urls: 'stun:59.110.35.198:3478' }]
@@ -131,6 +159,23 @@ function setupWebSocket() {
     }
   }
 }
+
+function startHeartbeat() {
+  stopHeartbeat() // 避免重复定时器
+  heartbeatTimer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send('ping')
+    }
+  }, 20000) // 每 10 秒发一次心跳
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer)
+    heartbeatTimer = null
+  }
+}
+
 
 function sendFile(file) {
   totalSize = file.size
