@@ -1,57 +1,60 @@
 <template>
   <div id="app">
-    <h1>高速 P2P 大文件传输11</h1>
+    <h1>高速 P2P 大文件传输</h1>
 
-    <input type="file" @change="onFileChange" />
-    <button @click="startTransfer" :disabled="!file">开始传输</button>
+    <div v-if="!file && !receiving && !incomingFileMeta">
+      <input type="file" @change="onFileChange" />
+      <button @click="startTransfer" :disabled="!file">开始传输</button>
+    </div>
 
     <div v-if="file">
-      <p>文件名: {{ file.name }}</p>
+      <p>发送文件: {{ file.name }}</p>
       <p>发送进度: {{ progress }}%</p>
       <progress :value="progress" max="100"></progress>
     </div>
 
-    <div v-if="fileMetaReceived && !receiving">
-      <p>准备接收文件：{{ fileName }}（{{ fileSizeText }}）</p>
-      <button @click="confirmReceive">接收</button>
+    <div v-if="incomingFileMeta && !receiving">
+      <p>📦 收到文件请求: {{ incomingFileMeta.name }}</p>
+      <button @click="acceptAndStartReceiving">开始接收</button>
     </div>
 
     <div v-if="receiving">
-      <p>接收文件: {{ fileName }}</p>
+      <p>接收文件: {{ incomingFileMeta.name }}</p>
       <p>接收进度: {{ downloadProgress }}%</p>
       <progress :value="downloadProgress" max="100"></progress>
+      <button v-if="downloadUrl" @click="downloadFile">点击下载文件</button>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, reactive, onMounted } from 'vue'
 
 const file = ref(null)
 const progress = ref(0)
 const downloadProgress = ref(0)
 const receiving = ref(false)
-const fileName = ref('')
-const fileSizeText = ref('')
-const fileMetaReceived = ref(false)
+const incomingFileMeta = ref(null) // {name, size, sliceSize, totalSlices, channelCount}
 
-let ws, pc
+let ws = null
+let pc = null
 let SLICE_SIZE = 512 * 1024
 let CHANNEL_COUNT = 4
 
-let writer = null
-let sliceSize = 0
-let totalSlices = 0
 let receivedCount = 0
-let fileMeta = null
+let receivedSlices = []
+let downloadUrl = ref('')
 
 const onFileChange = (e) => {
   file.value = e.target.files[0]
+  progress.value = 0
 }
 
-const waitForSocketOpen = (ws) => new Promise((resolve) => {
-  ws.readyState === WebSocket.OPEN ? resolve() : (ws.onopen = resolve)
-})
+const waitForSocketOpen = (ws) =>
+  new Promise((resolve) => {
+    if (ws.readyState === WebSocket.OPEN) resolve()
+    else ws.onopen = () => resolve()
+  })
 
 let heartbeatTimer = null
 let reconnectTimer = null
@@ -89,7 +92,13 @@ function setupWebSocket() {
 
     ws.onmessage = async (event) => {
       if (event.data === 'pong') return
-      const msg = JSON.parse(event.data)
+      let msg
+      try {
+        msg = JSON.parse(event.data)
+      } catch {
+        console.warn('[WebSocket] 非 JSON 消息:', event.data)
+        return
+      }
 
       if (msg.type === 'answer') {
         await pc.setRemoteDescription(new RTCSessionDescription(msg.answer))
@@ -100,18 +109,18 @@ function setupWebSocket() {
           console.error('ICE candidate error:', e)
         }
       } else if (msg.type === 'fileMeta') {
-        fileMeta = msg
-        fileName.value = msg.name
-        fileSizeText.value = (msg.size / 1024 / 1024).toFixed(2) + ' MB'
-        fileMetaReceived.value = true
+        // 收到文件元信息，提示接收
+        incomingFileMeta.value = msg
       } else if (msg.type === 'offer') {
+        // 被动接收方收到 offer，建立连接并发 answer
         pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:59.110.35.198:3478' }] })
+
+        pc.ondatachannel = onDataChannelHandler
+
         await pc.setRemoteDescription(new RTCSessionDescription(msg.offer))
         const answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
         ws.send(JSON.stringify({ type: 'answer', answer }))
-      } else if (msg.type === 'startSending') {
-        sendFileParallel(activeChannels)
       }
     }
 
@@ -128,9 +137,11 @@ function setupWebSocket() {
   })
 }
 
-let activeChannels = []
+onMounted(() => {
+  setupWebSocket()
+})
 
-const startTransfer = async () => {
+async function startTransfer() {
   if (!ws || ws.readyState >= WebSocket.CLOSING) {
     await setupWebSocket()
   }
@@ -145,15 +156,15 @@ const startTransfer = async () => {
     ch.binaryType = 'arraybuffer'
     channels.push(ch)
 
-    openPromises.push(new Promise((resolve) => {
-      ch.onopen = () => {
-        console.log(`[DataChannel] ${ch.label} opened`)
-        resolve()
-      }
-    }))
+    openPromises.push(
+      new Promise((resolve) => {
+        ch.onopen = () => {
+          console.log(`[DataChannel] ${ch.label} 已打开`)
+          resolve()
+        }
+      })
+    )
   }
-
-  activeChannels = channels
 
   pc.onicecandidate = (e) => {
     if (e.candidate) {
@@ -166,22 +177,25 @@ const startTransfer = async () => {
   ws.send(JSON.stringify({ type: 'offer', offer }))
 
   await Promise.all(openPromises)
-  console.log('🟢 所有通道都 open，等待接收端确认...')
+  console.log('🟢 所有通道打开，开始并行发送文件')
+  sendFileParallel(channels)
 }
 
-const sendFileParallel = async (channels) => {
+async function sendFileParallel(channels) {
   const f = file.value
   const total = Math.ceil(f.size / SLICE_SIZE)
   let sent = 0
 
-  ws.send(JSON.stringify({
-    type: 'fileMeta',
-    name: f.name,
-    size: f.size,
-    sliceSize: SLICE_SIZE,
-    totalSlices: total,
-    channelCount: channels.length
-  }))
+  ws.send(
+    JSON.stringify({
+      type: 'fileMeta',
+      name: f.name,
+      size: f.size,
+      sliceSize: SLICE_SIZE,
+      totalSlices: total,
+      channelCount: channels.length,
+    })
+  )
 
   for (let i = 0; i < total; i++) {
     const start = i * SLICE_SIZE
@@ -195,8 +209,11 @@ const sendFileParallel = async (channels) => {
     payload.set(new Uint8Array(buffer), header.byteLength)
 
     const ch = channels[i % channels.length]
+
     if (ch.readyState === 'open') {
       ch.send(payload)
+    } else {
+      console.warn(`[WARN] 通道 ${ch.label} 非 open 状态，跳过片段 ${i}`)
     }
 
     sent++
@@ -204,42 +221,57 @@ const sendFileParallel = async (channels) => {
   }
 }
 
-const confirmReceive = async () => {
-  const handle = await window.showSaveFilePicker({ suggestedName: fileMeta.name })
-  const stream = await handle.createWritable()
-  writer = stream.getWriter()
+function onDataChannelHandler(event) {
+  const channel = event.channel
+  channel.binaryType = 'arraybuffer'
 
-  sliceSize = fileMeta.sliceSize
-  totalSlices = fileMeta.totalSlices
-  receivedCount = 0
-  receiving.value = true
-  fileMetaReceived.value = false
+  channel.onmessage = async (event) => {
+    const buf = event.data
+    const view = new DataView(buf)
+    const index = view.getUint32(0, false)
+    const data = buf.slice(4)
 
-  ws.send(JSON.stringify({ type: 'startSending' }))
+    receivedSlices[index] = data
+    receivedCount++
+    downloadProgress.value = ((receivedCount / incomingFileMeta.value.totalSlices) * 100).toFixed(2)
 
-  pc.ondatachannel = (event) => {
-    const channel = event.channel
-    channel.binaryType = 'arraybuffer'
-    channel.onmessage = async (event) => {
-      const buf = event.data
-      const view = new DataView(buf)
-      const index = view.getUint32(0, false)
-      const data = buf.slice(4)
-      await writer.write({ type: 'write', position: index * sliceSize, data })
-      receivedCount++
-      downloadProgress.value = ((receivedCount / totalSlices) * 100).toFixed(2)
-      if (receivedCount === totalSlices) {
-        await writer.close()
-        receiving.value = false
-        alert('✅ 文件接收完成')
-      }
+    if (receivedCount === incomingFileMeta.value.totalSlices) {
+      receiving.value = false
+
+      const blob = new Blob(receivedSlices)
+      downloadUrl.value = URL.createObjectURL(blob)
+      alert('✅ 文件接收完成，点击下载按钮保存文件')
     }
   }
 }
 
-onMounted(() => {
-  setupWebSocket()
-})
+function acceptAndStartReceiving() {
+  if (!incomingFileMeta.value) return
+  receiving.value = true
+  receivedCount = 0
+  receivedSlices = new Array(incomingFileMeta.value.totalSlices)
+  downloadProgress.value = 0
+
+  // 创建 RTCPeerConnection 和回答offer已在 ws.onmessage中处理
+
+  // 这里主要是显示“开始接收”按钮控制的开关
+}
+
+function downloadFile() {
+  const a = document.createElement('a')
+  a.href = downloadUrl.value
+  a.download = incomingFileMeta.value.name || 'download'
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(downloadUrl.value)
+  downloadUrl.value = ''
+  incomingFileMeta.value = null
+  receiving.value = false
+  receivedSlices = []
+  receivedCount = 0
+}
 </script>
 
 <style>
@@ -249,6 +281,7 @@ onMounted(() => {
   font-family: Arial, sans-serif;
   padding: 2rem;
 }
+
 progress {
   width: 100%;
   height: 20px;
