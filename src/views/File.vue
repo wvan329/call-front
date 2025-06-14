@@ -119,7 +119,7 @@ async function setupWebSocket() {
     reconnectTimer = null
   }
 
-  ws = new WebSocket('ws://59.110.35.198/wgk/ws/file')
+  ws = new WebSocket('ws://59.110.35.198/call-api/ws/file')
 
   ws.onopen = () => {
     console.log('[WebSocket] 已连接')

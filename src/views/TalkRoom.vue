@@ -44,7 +44,7 @@
 import { ref, onMounted, onUnmounted } from 'vue';
 
 // --- 配置 ---
-const WEBSOCKET_URL = 'ws://59.110.35.198/wgk/ws/voice';
+const WEBSOCKET_URL = 'ws://59.110.35.198/call-api/ws/voice';
 const MAX_RECONNECT_ATTEMPTS = 10;
 
 // --- 响应式状态 ---
