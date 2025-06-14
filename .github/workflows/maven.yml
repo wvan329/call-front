@@ -37,5 +37,5 @@ jobs:
           SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
           REMOTE_HOST: 59.110.35.198
           REMOTE_USER: root
-          SOURCE: 'dist'
+          SOURCE: 'dist/'
           TARGET: /var/lib/docker/volumes/nginx-html/_data/call
