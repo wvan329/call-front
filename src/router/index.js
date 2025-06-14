@@ -4,7 +4,7 @@ import TalkRoom from '@/views/TalkRoom.vue'
 import File from '@/views/File.vue' // 你刚创建的那个组件
 
 const routes = [
-  { path: '/', redirect: '/call/talk' },
+  { path: '/call', redirect: '/call/talk' },
   { path: '/call/talk', component: TalkRoom },
   { path: '/call/file', component: File },
 ]

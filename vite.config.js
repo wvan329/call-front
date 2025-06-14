@@ -6,6 +6,9 @@ import vueDevTools from 'vite-plugin-vue-devtools'
 
 // https://vite.dev/config/
 export default defineConfig({
+
+  base: '/call/',  // ✅ 关键点：部署路径
+
   plugins: [
     vue(),
     vueDevTools(),
